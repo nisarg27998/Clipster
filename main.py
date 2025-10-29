@@ -1,26 +1,3 @@
-"""
-Clipster v1.2 - main.py
-(Refined upgrade of v1.1)
-
-Changes & Improvements:
-  • Removed bottom status bar and cancel button.
-  • Added themed, non-blocking toast notifications.
-  • Replaced status updates with toast messages (e.g. “Fetching...”, “Download complete”).
-  • Optimized UI responsiveness and reduced startup delay.
-  • Minor bug fixes and smoother animations.
-  • Codebase prepared for future playlist/history integration.
-
-Dependencies:
-  pip install customtkinter requests pillow
-
-Place executables in /Assets/:
-  - yt-dlp.exe
-  - ffmpeg.exe
-  - ffprobe.exe
-  - ffplay.exe
-
-Run on Windows with Python 3.13.
-"""
 
 import os
 import sys
@@ -42,11 +19,13 @@ from tkinter import filedialog, messagebox
 
 from PIL import Image
 
+import tempfile
+
 # --------------------------------------------
 # Branding / Config
 # --------------------------------------------
 APP_NAME = "Clipster"
-APP_VERSION = "1.1"
+APP_VERSION = "1.2.1"
 ACCENT_COLOR = "#0078D7"
 SECONDARY_COLOR = "#00B7C2"
 SPLASH_TEXT = "Fetch. Download. Enjoy."
@@ -133,9 +112,14 @@ DEFAULT_SETTINGS = {
     "default_format": "mp4",
     "theme": "dark",
     "embed_thumbnail": True,
-    "default_download_path": str(DOWNLOADS_DIR),
-    "cookies_path": ""
+    # default to user's Windows Downloads folder (cross-platform fallback)
+    "default_download_path": str(Path.home() / "Downloads"),
+    "cookies_path": "",
+    "show_toasts": True,
+    "thumbnail_after_fetch": True
 }
+# -------------------------------------------------------------------------------
+
 
 def load_settings():
     """Load settings from JSON file, falling back to defaults."""
@@ -211,24 +195,91 @@ def now_str():
     """Get current datetime as string."""
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+# ------------------ Toast / notification helpers (add after now_str) ------------------
+def _is_windows():
+    return sys.platform.startswith("win")
+
+def show_toast(root, message, title=None, timeout=3000, level="info", theme="dark"):
+    """
+    Non-blocking themed toast. root = main CTk root.
+    timeout in milliseconds (int). level can be "info", "success", "error".
+    """
+    try:
+        if not getattr(root, "_toast_enabled", True):
+            return
+        toast = ctk.CTkToplevel(root)
+        toast.overrideredirect(True)
+        toast.attributes("-topmost", True)
+        # theme-based colors
+        if theme == "light":
+            bg = "#ffffff"
+            fg = "#000000"
+        else:
+            bg = "#1b1b1b"
+            fg = "#ffffff"
+        # Frame
+        frame = ctk.CTkFrame(toast, fg_color=bg, corner_radius=10, border_width=0)
+        frame.pack(fill="both", expand=True)
+        # Title / icon
+        title_text = title or ""
+        lbl_title = ctk.CTkLabel(frame, text=title_text, anchor="w", font=ctk.CTkFont(size=11, weight="bold"))
+        if title_text:
+            lbl_title.pack(fill="x", padx=12, pady=(8, 0))
+        lbl = ctk.CTkLabel(frame, text=message, anchor="w", font=ctk.CTkFont(size=11))
+        lbl.pack(fill="both", padx=12, pady=(6, 10))
+        # position: bottom-right of main window
+        try:
+            x = root.winfo_x() + root.winfo_width() - 320 - 16
+            y = root.winfo_y() + root.winfo_height() - 120 - 16
+            toast.geometry(f"320x86+{x}+{y}")
+        except Exception:
+            toast.geometry("320x86+100+100")
+        # auto-destroy
+        toast.after(timeout, lambda: (toast.destroy()))
+    except Exception:
+        pass
+
+# convenience wrapper that checks settings
+def _toast(app, message, title=None, timeout=3000, level="info"):
+    if not getattr(app, "settings", None):
+        return
+    if not app.settings.get("show_toasts", True):
+        return
+    try:
+        show_toast(app.root, message, title=title, timeout=timeout, level=level, theme=app.settings.get("theme","dark"))
+    except Exception:
+        pass
+# ---------------------------------------------------------------------------------------
+
+
 # --------------------------------------------
 # Metadata via yt-dlp --dump-json (blocking small call)
 # --------------------------------------------
 def fetch_metadata_via_yt_dlp(url, timeout=30):
-    """Fetch video metadata using yt-dlp."""
+    """Fetch video metadata using yt-dlp; hides console window on Windows."""
     if not YT_DLP_EXE.exists():
         raise FileNotFoundError("yt-dlp.exe not found in Assets/")
     cmd = [windows_quote(str(YT_DLP_EXE)), "--no-warnings", "--skip-download", "--dump-json", url]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        # Windows: hide window
+        kwargs = {"capture_output": True, "text": True, "timeout": timeout}
+        if _is_windows():
+            # Use STARTUPINFO to hide
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = subprocess.SW_HIDE
+            kwargs["startupinfo"] = si
+            kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+        proc = subprocess.run(cmd, **kwargs)
         out = proc.stdout.strip()
         if proc.returncode != 0:
-            stderr = proc.stderr.strip() or proc.stdout.strip()
-            if "Sign in to confirm your age" in stderr or "members-only" in stderr or "This video is only available for members" in stderr:
+            stderr = (proc.stderr or "").strip() or out
+            if any(x in stderr for x in ("Sign in to confirm your age", "members-only", "This video is only available for members")):
                 raise RuntimeError("This video is age-restricted or members-only and requires sign-in. Clipster cannot download it.")
             raise RuntimeError(stderr or "yt-dlp failed to fetch metadata")
         if not out:
             raise RuntimeError("No metadata returned by yt-dlp")
+        # find the first JSON object in output
         first_json = None
         for line in out.splitlines():
             if line.strip().startswith("{"):
@@ -241,6 +292,8 @@ def fetch_metadata_via_yt_dlp(url, timeout=30):
         raise RuntimeError("yt-dlp timed out while fetching metadata")
     except json.JSONDecodeError as e:
         raise RuntimeError(f"Failed to parse yt-dlp output as JSON: {e}")
+# ---------------------------------------------------------------------------------------
+
 
 # --------------------------------------------
 # Download process wrapper (yt-dlp)
@@ -258,7 +311,7 @@ class DownloadProcess:
         return thread
 
     def _run_download(self, url, outdir, filename_template, format_selector, cookies_path, progress_callback, finished_callback, error_callback):
-        """Internal method to run yt-dlp subprocess."""
+        """Internal method to run yt-dlp subprocess (hidden window on Windows)."""
         if not YT_DLP_EXE.exists():
             if error_callback: error_callback("yt-dlp.exe not found in Assets/")
             return
@@ -269,13 +322,23 @@ class DownloadProcess:
         cmd += ["-o", outtmpl, "-f", format_selector, url]
 
         try:
-            with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True) as p:
+            popen_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT, "text": True, "bufsize": 1, "universal_newlines": True}
+            if _is_windows():
+                si = subprocess.STARTUPINFO()
+                si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                si.wShowWindow = subprocess.SW_HIDE
+                popen_kwargs["startupinfo"] = si
+                popen_kwargs["creationflags"] = 0x08000000  # CREATE_NO_WINDOW
+            with subprocess.Popen(cmd, **popen_kwargs) as p:
                 with self._lock:
                     self.proc = p
                 output_path = None
                 for raw_line in p.stdout:
+                    if raw_line is None:
+                        continue
                     line = raw_line.strip()
-                    if "Sign in to confirm your age" in line or "This video is only available for members" in line or "This video is private" in line:
+                    # age-restricted detection
+                    if any(x in line for x in ("Sign in to confirm your age", "This video is only available for members", "This video is private")):
                         if error_callback:
                             error_callback("Age-restricted or members-only content detected. Clipster cannot download without authentication.")
                         try:
@@ -300,6 +363,7 @@ class DownloadProcess:
                     if etam:
                         eta = etam.group(1)
                     if line.startswith("Destination:"):
+                        # yt-dlp prints Destination: path
                         output_path = line.partition("Destination:")[2].strip()
                     if progress_callback:
                         progress_callback(percent, speed, eta, line)
@@ -334,61 +398,136 @@ class DownloadProcess:
 # --------------------------------------------
 # Thumbnail download & embed (ffmpeg)
 # --------------------------------------------
-def download_thumbnail(url, target_path, timeout=20):
-    """Download thumbnail from URL to local path."""
+def download_thumbnail(url, target_filename=None, timeout=20):
+    """Download thumbnail from URL to user's Downloads folder."""
     try:
+        downloads_path = str(Path.home() / "Downloads")
+        os.makedirs(downloads_path, exist_ok=True)
+        if not target_filename:
+            filename = f"clipster_thumb_{int(time.time())}.jpg"
+        else:
+            filename = target_filename
+        target_path = os.path.join(downloads_path, filename)
+
         r = requests.get(url, stream=True, timeout=timeout)
         r.raise_for_status()
         with open(target_path, "wb") as f:
             shutil.copyfileobj(r.raw, f)
-        return True
+
+        return target_path  # return saved file path
     except Exception as e:
         log_message(f"download_thumbnail error: {e}")
-        return False
+        return None
+
+
+# ------------------ New helper: get_best_thumbnail_url ------------------
+def get_best_thumbnail_url(meta_or_url_or_vid):
+    """
+    Given meta dict, full url, or vid id - return a likely thumbnail URL.
+    Tries meta['thumbnail'] first, then YouTube standard endpoints.
+    """
+    try:
+        if isinstance(meta_or_url_or_vid, dict):
+            t = meta_or_url_or_vid.get("thumbnail")
+            if t:
+                return t
+            url = meta_or_url_or_vid.get("webpage_url") or meta_or_url_or_vid.get("url") or ""
+        else:
+            url = str(meta_or_url_or_vid or "")
+        # attempt to extract video id
+        vid = None
+        if "watch?v=" in url or "youtu.be" in url or "youtube" in url:
+            vid = None
+            try:
+                parsed = urlparse(url)
+                if parsed.netloc and "youtu.be" in parsed.netloc:
+                    vid = parsed.path.lstrip("/")
+                else:
+                    qs = parse_qs(parsed.query)
+                    if "v" in qs:
+                        vid = qs["v"][0]
+            except Exception:
+                vid = None
+        if not vid:
+            # maybe passed a raw id
+            m = re.search(r"([A-Za-z0-9_-]{11})", url)
+            if m:
+                vid = m.group(1)
+        if vid:
+            # try high-quality variants in order
+            candidates = [
+                f"https://i.ytimg.com/vi/{vid}/maxresdefault.jpg",
+                f"https://i.ytimg.com/vi/{vid}/sddefault.jpg",
+                f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
+                f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg",
+            ]
+            return candidates[0]  # caller will attempt download & fallback to others if missing
+        return None
+    except Exception:
+        return None
+# ---------------------------------------------------------------------------------------
+
 
 def embed_thumbnail_with_ffmpeg(video_path, thumb_path):
-    """Embed thumbnail into video using ffmpeg."""
+    """Embed thumbnail into video using ffmpeg in a safe atomic way."""
     if not FFMPEG_EXE.exists():
         return False
     video_path = Path(video_path)
     thumb_path = Path(thumb_path)
-    out_tmp = video_path.with_suffix(video_path.suffix + ".thumbtmp" + video_path.suffix)
-    cmd = [
-        windows_quote(str(FFMPEG_EXE)),
-        "-y",
-        "-i", str(video_path),
-        "-i", str(thumb_path),
-        "-map", "0",
-        "-map", "1",
-        "-c", "copy",
-        "-disposition:v:1", "attached_pic",
-        str(out_tmp)
-    ]
+    if not video_path.exists() or not thumb_path.exists():
+        return False
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        with tempfile.NamedTemporaryFile(prefix="clipster_ffmpeg_", suffix=video_path.suffix, delete=False) as tmpf:
+            out_tmp = Path(tmpf.name)
+        cmd = [
+            windows_quote(str(FFMPEG_EXE)),
+            "-y",
+            "-i", str(video_path),
+            "-i", str(thumb_path),
+            "-map", "0",
+            "-map", "1",
+            "-c", "copy",
+            "-disposition:v:1", "attached_pic",
+            str(out_tmp)
+        ]
+        popen_kwargs = {"capture_output": True, "text": True}
+        if _is_windows():
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = subprocess.SW_HIDE
+            popen_kwargs["startupinfo"] = si
+            popen_kwargs["creationflags"] = 0x08000000
+        proc = subprocess.run(cmd, **popen_kwargs)
         if proc.returncode != 0:
-            if out_tmp.exists():
+            try:
                 out_tmp.unlink(missing_ok=True)
+            except Exception:
+                pass
             log_message(f"FFmpeg embed failed: {proc.stderr}")
             return False
-        backup = video_path.with_suffix(video_path.suffix + ".bak")
+        # atomic replace
         try:
+            backup = video_path.with_suffix(video_path.suffix + ".bak")
             video_path.replace(backup)
             out_tmp.replace(video_path)
             backup.unlink(missing_ok=True)
         except Exception:
             try:
-                os.remove(str(video_path))
+                os.replace(str(out_tmp), str(video_path))
             except Exception:
-                pass
-            try:
-                shutil.move(str(out_tmp), str(video_path))
-            except Exception:
+                log_message("embed_thumbnail_with_ffmpeg: atomic replace failed")
                 return False
+        # cleanup thumb
+        try:
+            thumb_path.unlink(missing_ok=True)
+        except Exception:
+            pass
         return True
     except Exception as e:
         log_message(f"embed_thumbnail_with_ffmpeg exception: {e}")
         return False
+# ---------------------------------------------------------------------------------------
+
 
 # --------------------------------------------
 # Format selector helpers
@@ -439,6 +578,13 @@ class ClipsterApp:
     """Main application class for Clipster GUI."""
     def __init__(self, root):
         self.root = root
+
+        # enable toasts on root
+        try:
+            self.root._toast_enabled = True
+        except Exception:
+            pass
+
         self.root.title(f"{APP_NAME} - {SPLASH_TEXT}")
         self.root.geometry("1000x700")
         self.root.minsize(900, 600)
@@ -447,10 +593,9 @@ class ClipsterApp:
         self.root.withdraw()
 
         ensure_directories()
-        missing = check_executables()
-        if missing:
-            messagebox.showwarning(APP_NAME, f"Missing executables in Assets/: {', '.join(missing)}")
-            log_message(f"Missing executables: {missing}")
+        # Defer executable checks to after UI is shown to speed up initial render
+        self.root.after(800, self._deferred_executables_check)
+
 
         self.settings = load_settings()
         self.history = load_history()
@@ -477,6 +622,17 @@ class ClipsterApp:
 
         # Show window after setup to avoid flashing
         self.root.after(200, self._show_window_after_setup)
+
+    def _deferred_executables_check(self):
+        try:
+            missing = check_executables()
+            if missing:
+                # use toast + log rather than blocking messagebox at startup
+                _toast(self, f"Missing executables: {', '.join(missing)}", title="Assets")
+                log_message(f"Missing executables: {missing}")
+        except Exception as e:
+            log_message(f"_deferred_executables_check error: {e}")
+
 
     def _show_window_after_setup(self):
         """Show the window after initial setup to reduce flashing."""
@@ -698,9 +854,22 @@ class ClipsterApp:
             except Exception:
                 pass
             return False
+        
+    def _recreate_drag_ghost(self):
+        """Ensure drag ghost matches current accent color and theme."""
+        try:
+            if self._drag_ghost:
+                try:
+                    self._drag_ghost.destroy()
+                except Exception:
+                    pass
+            self._drag_ghost = ctk.CTkFrame(self.playlist_scroll, height=6, fg_color=ACCENT_COLOR)
+            # not packed now — created fresh
+        except Exception:
+            self._drag_ghost = None
 
     def _apply_theme(self):
-        """Apply theme to the application."""
+        """Apply theme to the application. (override to recreate drag ghost to avoid desync)"""
         ctk.set_appearance_mode(self.settings.get("theme", "dark"))
         try:
             self.root.configure(fg_color=ctk.ThemeManager.theme["CTkFrame"]["fg_color"])
@@ -709,6 +878,11 @@ class ClipsterApp:
         self.refresh_history()
         self._update_titlebar_theme()
         self._enable_mica_effect()
+        # recreate drag ghost to avoid desync
+        try:
+            self._recreate_drag_ghost()
+        except Exception:
+            pass
         self.root.update_idletasks()
 
     def _on_theme_combo_changed(self, choice):
@@ -716,7 +890,8 @@ class ClipsterApp:
         self.settings["theme"] = choice
         ctk.set_appearance_mode(choice)      # instant switch
         self._apply_theme()                  # update title-bar, Mica, etc.
-        self.status_var.set(f"Theme changed to {choice}.")
+        _toast(self, f"Theme changed to {choice}.", title="Theme")
+
 
     def _update_titlebar_theme(self):
         """Update titlebar colors based on theme."""
@@ -880,14 +1055,8 @@ class ClipsterApp:
         self._build_history_tab(self.tabs.tab("History"))
         self._build_settings_tab(self.tabs.tab("Settings"))
 
-        self.status_var = ctk.StringVar(value="Ready")
-        status_bar = ctk.CTkFrame(self.root, height=40)
-        status_bar.pack(fill="x", padx=12, pady=(6, 12))
-        self.status_label = ctk.CTkLabel(status_bar, textvariable=self.status_var)
-        self.status_label.pack(side="left", padx=8)
-        self.cancel_btn = ctk.CTkButton(status_bar, text="Cancel Download", width=140, command=self.cancel_download, fg_color=ACCENT_COLOR)
-        self.cancel_btn.pack(side="right", padx=8)
-        self.cancel_btn.configure(state="disabled")
+        self.status_var = None
+        self.cancel_btn = None
 
         self.spinner_overlay = None
 
@@ -905,6 +1074,11 @@ class ClipsterApp:
 
         self.fetch_meta_btn = ctk.CTkButton(left, text="Fetch Metadata", fg_color=ACCENT_COLOR, command=self.on_fetch_single_metadata)
         self.fetch_meta_btn.pack(padx=8, pady=6)
+
+        # Save thumbnail button (disabled until metadata fetched)
+        self.save_thumb_btn = ctk.CTkButton(left, text="Save Thumbnail", fg_color="gray", command=self.on_save_thumbnail)
+        self.save_thumb_btn.pack(padx=8, pady=(0,6))
+        self.save_thumb_btn.configure(state="disabled")
 
         ctk.CTkLabel(left, text="Resolution:", anchor="w").pack(padx=8, pady=(8, 0))
         self.single_resolution_combo = ctk.CTkComboBox(left, values=["Best Available"], width=200)
@@ -945,6 +1119,34 @@ class ClipsterApp:
 
         self.thumbnail_label = ctk.CTkLabel(right, text="Thumbnail preview", width=320, height=180, anchor="center")
         self.thumbnail_label.pack(anchor="nw", padx=8, pady=12)
+
+    def on_save_thumbnail(self):
+        """Save the last fetched thumbnail to user's Downloads folder."""
+        try:
+            # attempt to find current thumbnail image path from thumbnail_label
+            cur_img = getattr(self.thumbnail_label, "image_path", None)
+            # we store the path on fetch below; fallback to meta lookup
+            if not cur_img and hasattr(self, "_last_meta"):
+                turl = self._last_meta.get("thumbnail")
+                if turl:
+                    vid = self._extract_video_id(self.single_url_entry.get().strip()) or int(time.time())
+                    target = Path(self.settings.get("default_download_path", str(Path.home() / 'Downloads'))) / f"{vid}_thumbnail.jpg"
+                    thumb_path = download_thumbnail(thumb_url)
+                    if thumb_path:
+                        _toast(self, f"Thumbnail saved: {target}", title="Thumbnail", timeout=3500)
+                        return
+            if cur_img and os.path.exists(cur_img):
+                downloads = Path(self.settings.get("default_download_path", str(Path.home() / "Downloads")))
+                downloads.mkdir(parents=True, exist_ok=True)
+                out = downloads / Path(cur_img).name
+                shutil.copyfile(cur_img, out)
+                _toast(self, f"Thumbnail saved: {out}", title="Thumbnail")
+                return
+            _toast(self, "No thumbnail available to save.", title="Thumbnail", level="error")
+        except Exception as e:
+            log_message(f"on_save_thumbnail error: {e}")
+            _toast(self, "Failed to save thumbnail.", title="Thumbnail", level="error")
+
 
     def _build_batch_tab(self, parent):
         """Build UI for Batch Downloader tab."""
@@ -1193,7 +1395,8 @@ class ClipsterApp:
         save_settings(self.settings)
         log_message(f"Settings applied: {self.settings}")
         self._apply_theme()
-        self.status_var.set("Settings applied.")
+        _toast(self, "Settings applied.", title="Settings")
+
 
     def on_reset_defaults(self):
         """Reset settings to defaults."""
@@ -1209,7 +1412,8 @@ class ClipsterApp:
             self.default_download_path_entry.insert(0, str(DOWNLOADS_DIR))
             log_message("Settings reset to defaults")
             self._apply_theme()
-            self.status_var.set("Settings reset to defaults.")
+            _toast(self, "Settings reset to defaults.", title="Settings")
+
 
     def on_choose_download_folder(self):
         """Choose default download folder."""
@@ -1343,8 +1547,8 @@ class ClipsterApp:
         fmt_selector = build_format_selector_for_format_and_res(fmt, res_label)
         filename_template = "%(title)s.%(ext)s"
         self.single_download_btn.configure(state="disabled")
-        self.cancel_btn.configure(state="normal")
-        self.status_var.set("Downloading...")
+        # cancel button removed; notify user with a toast instead
+        _toast(self, "Download started...", title="Download", timeout=3000)
         self.single_progress.set(0)
         self.single_progress_label.configure(text="Starting...")
         self.current_task_cancelled = False
@@ -1384,8 +1588,8 @@ class ClipsterApp:
         embed_thumb = self.batch_embed_var.get()
         outdir = self.settings.get("default_download_path", str(DOWNLOADS_DIR))
         fmt_selector = build_batch_format_selector(target_format, max_res)
-        self.cancel_btn.configure(state="normal")
-        self.status_var.set(f"Downloading batch ({len(urls)} items)...")
+        # cancel button removed; show a starting toast instead of status_var
+        _toast(self, f"Downloading batch ({len(urls)} items)...", title="Downloading", timeout=3000)
         self.batch_overall_progress.set(0)
         total = len(urls)
         completed = 0
@@ -1481,8 +1685,18 @@ class ClipsterApp:
                     windows_quote(str(YT_DLP_EXE)),
                     "--no-warnings", "--flat-playlist", "--dump-json", url
                 ]
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, universal_newlines=True)
+
+                popen_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE, "text": True, "bufsize": 1, "universal_newlines": True}
+                if _is_windows():
+                    si = subprocess.STARTUPINFO()
+                    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    si.wShowWindow = subprocess.SW_HIDE
+                    popen_kwargs["startupinfo"] = si
+                    popen_kwargs["creationflags"] = 0x08000000
+                proc = subprocess.Popen(cmd, **popen_kwargs)
+                
                 index = 0
+                seen_ids = set()
                 for line in iter(proc.stdout.readline, ''):
                     if line is None:
                         break
@@ -1495,14 +1709,16 @@ class ClipsterApp:
                         vid_id = data.get("id")
                         if not vid_id:
                             vid_id = data.get("url") or None
-                        if not vid_id:
+                        if not vid_id or vid_id in seen_ids:
                             continue
+                        seen_ids.add(vid_id)
                         full_url = f"https://youtube.com/watch?v={vid_id}"
                         entry = {"title": title, "url": full_url, "id": vid_id}
                         index += 1
                         self.ui_queue.put(("playlist_item_add", index, entry))
                     except Exception:
                         continue
+
 
                 try:
                     proc.stdout.close()
@@ -1542,8 +1758,8 @@ class ClipsterApp:
         outdir = self.settings.get("default_download_path", str(DOWNLOADS_DIR))
         fmt_selector = build_batch_format_selector(target_format, max_res)
 
-        self.cancel_btn.configure(state="normal")
-        self.status_var.set(f"Downloading {len(selected_entries)} selected items...")
+        # cancel button removed; notify user via toast
+        _toast(self, f"Downloading {len(selected_entries)} selected items...", title="Downloading", timeout=3000)
         self.playlist_overall_progress.set(0)
         self.current_task_cancelled = False
 
@@ -1664,7 +1880,7 @@ class ClipsterApp:
         try:
             self.root.clipboard_clear()
             self.root.clipboard_append(url)
-            self.status_var.set("URL copied to clipboard.")
+            _toast(self, "URL copied to clipboard.")
         except Exception:
             messagebox.showinfo(APP_NAME, "Failed to copy to clipboard — please select and copy manually.")
 
@@ -1681,7 +1897,7 @@ class ClipsterApp:
             except Exception:
                 pass
             self._rebuild_playlist_order()
-            self.status_var.set("Removed item from playlist view.")
+            _toast(self, "Removed item from playlist view.")
 
     def _on_row_button_press(self, event, row):
         """Start drag operation."""
@@ -1791,12 +2007,11 @@ class ClipsterApp:
         """Cancel current download."""
         self.current_task_cancelled = True
         self.download_proc.cancel()
-        self.cancel_btn.configure(state="disabled")
         try:
             self.single_download_btn.configure(state="normal")
         except Exception:
             pass
-        self.status_var.set("Download cancelled.")
+        _toast(self, "Download cancelled.", title="Cancelled", level="error")
 
     def _process_ui_queue(self):
         """Process UI update queue."""
@@ -1816,6 +2031,7 @@ class ClipsterApp:
             meta, sorted_res, thumb_local = item[1], item[2], item[3]
             self.fetch_meta_btn.configure(state="normal")
             self.hide_spinner()
+
             title = meta.get("title", "")
             uploader = meta.get("uploader", "")
             duration = meta.get("duration_string", meta.get("duration", ""))
@@ -1824,20 +2040,70 @@ class ClipsterApp:
             self.meta_duration_var.set(f"Duration: {duration}")
             self.single_resolution_combo.configure(values=sorted_res)
             self.single_resolution_combo.set(sorted_res[0] if sorted_res else "Best Available")
+
+            # set last meta for possible thumbnail save
+            self._last_meta = meta
+
+            # thumbnail handling
             if thumb_local and os.path.exists(str(thumb_local)):
                 try:
                     ctkimg = self._safe_create_ctkimage(str(thumb_local), (320, 180))
                     if ctkimg:
                         self.thumbnail_label.configure(image=ctkimg, text="")
                         self.thumbnail_label.image = ctkimg
+                        # remember path for Save Thumbnail feature
+                        self.thumbnail_label.image_path = str(thumb_local)
+                        # enable save button
+                        try:
+                            self.save_thumb_btn.configure(state="normal", fg_color=SECONDARY_COLOR)
+                        except Exception:
+                            pass
                     else:
                         self.thumbnail_label.configure(text="Thumbnail saved")
+                        self.save_thumb_btn.configure(state="normal")
                 except Exception:
                     self.thumbnail_label.configure(text="Thumbnail saved")
+                    try:
+                        self.save_thumb_btn.configure(state="normal")
+                    except Exception:
+                        pass
             else:
-                self.thumbnail_label.configure(text="No thumbnail available")
-            self.status_var.set("Metadata fetched.")
+                # attempt to fetch better thumbnail via constructed endpoints
+                vid = self._extract_video_id(meta.get("webpage_url", ""))
+                if vid:
+                    # try common endpoints in order
+                    candidates = [
+                        f"https://i.ytimg.com/vi/{vid}/maxresdefault.jpg",
+                        f"https://i.ytimg.com/vi/{vid}/sddefault.jpg",
+                        f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+                    ]
+                    got = None
+                    for c in candidates:
+                        target = TEMP_DIR / f"thumb_{vid}_{Path(c).name}"
+                        if download_thumbnail(c, str(target)):
+                            got = str(target)
+                            break
+                    if got:
+                        try:
+                            ctkimg = self._safe_create_ctkimage(got, (320, 180))
+                            if ctkimg:
+                                self.thumbnail_label.configure(image=ctkimg, text="")
+                                self.thumbnail_label.image = ctkimg
+                                self.thumbnail_label.image_path = got
+                                try:
+                                    self.save_thumb_btn.configure(state="normal", fg_color=SECONDARY_COLOR)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                    else:
+                        self.thumbnail_label.configure(text="No thumbnail available")
+                else:
+                    self.thumbnail_label.configure(text="No thumbnail available")
+
+            _toast(self, "Metadata fetched.", title="Fetch complete")
             return
+
 
         if ev == "meta_error":
             err = item[1]
@@ -1847,7 +2113,7 @@ class ClipsterApp:
                 messagebox.showerror(APP_NAME, "This video is age-restricted or members-only and requires sign-in. Clipster cannot download it.\n\nTip: use yt-dlp with a cookies file (manual).")
             else:
                 messagebox.showerror(APP_NAME, f"Failed to fetch metadata: {err}")
-            self.status_var.set("Ready")
+            _toast(self, "Ready")
             return
 
         if ev == "single_progress":
@@ -1901,37 +2167,36 @@ class ClipsterApp:
             }
             append_history(entry)
             self.single_download_btn.configure(state="normal")
-            self.cancel_btn.configure(state="disabled")
             self.single_progress.set(0)
             self.single_progress_label.configure(text="")
-            self.status_var.set("Download finished.")
-            messagebox.showinfo(APP_NAME, f"Download finished: {output_path}")
+            _toast(self, "Download finished.", title="Complete", level="success", timeout=3500)
+            _toast(self, f"Download finished: {Path(output_path).name}", title="Complete", timeout=4000)
             self.refresh_history()
             return
 
         if ev == "single_error_restricted":
             err = item[1]
             self.single_download_btn.configure(state="normal")
-            self.cancel_btn.configure(state="disabled")
+            self.single_progress.set(0)
+            self.single_progress_label.configure(text="")
             self.hide_spinner()
             messagebox.showerror(APP_NAME, "This video requires you to be signed in (age-restricted or members-only). Clipster cannot download it without authentication.\n\nTip: use yt-dlp with a cookies file.")
-            self.status_var.set("Ready")
+            _toast(self, "Ready")
             return
 
         if ev == "single_error":
             err = item[1]
             self.single_download_btn.configure(state="normal")
-            self.cancel_btn.configure(state="disabled")
-            self.hide_spinner()
             self.single_progress.set(0)
             self.single_progress_label.configure(text="")
+            self.hide_spinner()
             messagebox.showerror(APP_NAME, f"Download failed: {err}")
-            self.status_var.set("Ready")
+            _toast(self, "Ready")
             return
 
         if ev == "batch_item_start":
             idx, url = item[1], item[2]
-            self.status_var.set(f"Downloading item {idx}...")
+            _toast(self, f"Downloading item {idx}...", title="Downloading", timeout=2000)
             return
 
         if ev == "batch_item_progress":
@@ -1948,16 +2213,14 @@ class ClipsterApp:
             completed, total = item[1], item[2]
             overall = completed / total if total else 0.0
             self.batch_overall_progress.set(overall)
-            self.status_var.set(f"Batch progress: {completed}/{total}")
+            _toast(self, f"Batch progress: {completed}/{total}", timeout=2200)
             self.refresh_history()
             return
 
         if ev == "batch_finished":
             completed, total = item[1], item[2]
-            self.cancel_btn.configure(state="disabled")
             self.batch_overall_progress.set(1.0)
-            self.status_var.set(f"Batch finished: {completed}/{total}")
-            messagebox.showinfo(APP_NAME, f"Batch finished: {completed}/{total}")
+            _toast(self, f"Batch finished: {completed}/{total}", title="Batch", timeout=3500)
             self.refresh_history()
             return
 
@@ -2026,7 +2289,7 @@ class ClipsterApp:
         if ev == "playlist_fetch_done":
             total = item[1]
             self.hide_spinner()
-            self.status_var.set(f"Fetched {total} playlist items.")
+            _toast(self, f"Fetched {total} playlist items.", title="Playlist", timeout=3000)
             try:
                 self.playlist_progress_label.configure(text=f"Fetched {total} items.")
             except Exception:
@@ -2037,7 +2300,7 @@ class ClipsterApp:
             err = item[1]
             self.hide_spinner()
             messagebox.showerror(APP_NAME, f"Playlist error: {err}")
-            self.status_var.set("Ready")
+            _toast(self, "Ready")
             return
 
         if ev == "playlist_thumb_ready":
@@ -2081,8 +2344,8 @@ class ClipsterApp:
 
         if ev == "redownload_finished":
             output_path = item[1]
-            self.status_var.set("Re-download finished.")
-            messagebox.showinfo(APP_NAME, f"Re-download finished: {output_path}")
+            _toast(self, "Re-download finished.", title="Re-Download", timeout=3000)
+            _toast(self, f"Re-download finished: {Path(output_path).name}", title="Re-Download", timeout=3500)
             self.refresh_history()
             return
 
@@ -2117,7 +2380,7 @@ class ClipsterApp:
             completed, total, vid = item[1], item[2], item[3]
             overall = completed / total if total else 0.0
             self.playlist_overall_progress.set(overall)
-            self.status_var.set(f"Playlist progress: {completed}/{total}")
+            _toast(self, f"Playlist progress: {completed}/{total}", timeout=2200)
             row = self._playlist_row_by_vid.get(vid)
             if row:
                 try:
@@ -2130,10 +2393,8 @@ class ClipsterApp:
 
         if ev == "playlist_seq_finished":
             completed, total = item[1], item[2]
-            self.cancel_btn.configure(state="disabled")
             self.playlist_overall_progress.set(1.0)
-            self.status_var.set(f"Playlist finished: {completed}/{total}")
-            messagebox.showinfo(APP_NAME, f"Playlist finished: {completed}/{total}")
+            _toast(self, f"Playlist finished: {completed}/{total}", timeout=3500)
             self.refresh_history()
             return
 
