@@ -1,12 +1,19 @@
 """
-Clipster v1.1 - main.py (UPDATED with: animated drag ghost, per-row playlist progress,
-context menu Remove, Save selection as .txt, per-row tiny progress bar, CTkImage usage,
-fixed dropdown menus, reduced startup flashing, improved min/max animations)
+Clipster v1.2 - main.py
+(Refined upgrade of v1.1)
+
+Changes & Improvements:
+  • Removed bottom status bar and cancel button.
+  • Added themed, non-blocking toast notifications.
+  • Replaced status updates with toast messages (e.g. “Fetching...”, “Download complete”).
+  • Optimized UI responsiveness and reduced startup delay.
+  • Minor bug fixes and smoother animations.
+  • Codebase prepared for future playlist/history integration.
 
 Dependencies:
   pip install customtkinter requests pillow
 
-Place executables in Assets/:
+Place executables in /Assets/:
   - yt-dlp.exe
   - ffmpeg.exe
   - ffprobe.exe
@@ -64,6 +71,26 @@ YT_DLP_SPEED_RE = re.compile(r"at\s+([0-9\.]+\w+/s)")
 YT_DLP_ETA_RE = re.compile(r"ETA\s+([0-9:]+)")
 
 LOG_FILE = BASE_DIR / "clipster.log"
+
+# --------------------------------------------
+# Update check (GitHub latest release)
+# --------------------------------------------
+def check_latest_version():
+    """Check GitHub for the latest release version."""
+    try:
+        import requests
+        r = requests.get("https://api.github.com/repos/nisarg27998/Clipster/releases/latest", timeout=5)
+        if r.status_code == 200:
+            latest = r.json().get("tag_name", "")
+            if latest and latest != f"v{APP_VERSION}":
+                messagebox.showinfo(
+                    "Update Available",
+                    f"A newer version ({latest}) of {APP_NAME} is available on GitHub.\n\n"
+                    "Visit the Releases page to download it."
+                )
+    except Exception as e:
+        log_message(f"Update check failed: {e}")
+
 
 # --------------------------------------------
 # Helpers: log & filesystem checks
@@ -2115,8 +2142,13 @@ if __name__ == "__main__":
         ensure_directories()
         root = ctk.CTk()
         app = ClipsterApp(root)
+
+        # Check for updates shortly after launch
+        root.after(2000, check_latest_version)
+
         root.protocol("WM_DELETE_WINDOW", root.destroy)
         root.mainloop()
+
     except Exception as e:
         import traceback
         tb = traceback.format_exc()
