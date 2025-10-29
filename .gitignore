@@ -1,0 +1,22 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+
+# Logs and temp files
+clipster.log
+*.log
+temp/
+downloads/
+
+# Virtual environments
+.venv/
+env/
+venv/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Executables and binaries
+*.exe
+Assets/*.exe
