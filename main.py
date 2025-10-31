@@ -32,7 +32,7 @@ import tempfile
 # Branding / Config
 # --------------------------------------------
 APP_NAME = "Clipster"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 ACCENT_COLOR = "#0078D7"
 SECONDARY_COLOR = "#00B7C2"
 SPLASH_TEXT = "Fetch. Download. Enjoy."
