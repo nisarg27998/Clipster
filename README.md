@@ -1,139 +1,85 @@
 # 🎬 Clipster
 
-**Clipster** is a modern **YouTube downloader for Windows**, built with **Python 3.13** and **CustomTkinter**, designed for simplicity, speed, and style.
+**Clipster** is a modern, elegant YouTube downloader for Windows — powered by **yt-dlp**, **FFmpeg**, and a sleek **CustomTkinter GUI**.
 
-It allows you to download single videos, playlists, or batches — all with a sleek UI and smart automation.
+> “Fetch. Download. Enjoy.”
 
 ---
 
-## 🚀 Features
+## ✨ Features
 
-### 🧠 Smart Download System
-- One-click video and playlist downloads  
-- Auto-selects best quality (video + audio merge)  
-- Playlist & batch download support  
-- Built-in progress tracking  
-- Intelligent filename handling  
-- Per-video and per-playlist progress indicators  
-- Resume incomplete downloads *(coming soon)*
+- 🎞️ **Single / Batch / Playlist** downloads
+- 🖼️ **Automatic thumbnail embedding**
+- 🧱 **Thread-safe architecture** — No UI freezes, no crashes
+- 💾 **Persistent settings and history**
+- ⚙️ **Format & resolution selection** (MP4, MKV, WEBM, M4A)
+- 🎨 **Windows 11 Mica interface**
+- 🌙 **Dark / Light theme support**
+- 🔔 **Toast notifications** for background updates
+- 🔄 **Auto-update check** from GitHub
 
-### 🎨 Modern Interface
-- Built using **CustomTkinter** for a clean, modern Windows look  
-- Dark, rounded, and responsive UI  
-- Animated transitions and drag indicators  
-- Toast notifications for status and completion  
-- Compact progress HUD *(coming soon)*  
+---
 
-### 🧰 Power Tools
-- FFmpeg-based merging and conversion  
-- Supports MP4, MKV, and MP3 formats  
-- Download history with thumbnails  
-- Context actions (Reopen / Redownload / Delete) *(planned)*  
-- Audio-only extraction *(coming soon)*
+## 🧠 New in v1.2.2 — *Stable & Thread-Safe Core*
+
+- 🔒 Atomic and thread-safe **settings/history writes**
+- 🧵 Background operations managed via **ThreadPoolExecutor**
+- 🪶 Smarter, cleaner **shutdown logic**
+- 🧩 Robust **yt-dlp** and **FFmpeg** subprocess handling
+- 🧾 Optional **debug logging mode**
+- 🪄 Unified **UI-safe event handling** via internal queue
 
 ---
 
 ## 📦 Installation
 
-You don’t need Python installed!  
-Just download the latest `.exe` from the [**Releases** section](https://github.com/yourusername/Clipster/releases) and run it directly.
+No setup required — just download the latest `.exe` release:
+
+👉 [**Clipster Releases on GitHub**](https://github.com/nisarg27998/Clipster/releases)
+
+**Included executables:**
+- `yt-dlp.exe`
+- `ffmpeg.exe`
+- `ffprobe.exe`
+- `ffplay.exe`
+
+> All are bundled inside Clipster.exe — no external dependencies needed.
 
 ---
 
-## 🧩 Requirements
-
-✅ None — the app comes fully packaged.  
-All dependencies (FFmpeg, yt-dlp, etc.) are pre-bundled inside the executable.
-
----
-
-## 🐞 Bug Fixes (v1.2.1)
-- Fixed: App crashing on invalid URLs  
-- Fixed: Playlist progress bar not updating properly  
-- Improved: Toast responsiveness and animations  
-- Improved: Error handling during downloads  
+## ⚙️ System Requirements
+- Windows 10 / 11 (64-bit)
+- Internet connection
+- GPU-accelerated UI (recommended)
 
 ---
 
-## 🧭 Roadmap
+## 🗺️ Roadmap
 
-### **v1.3 – Smart Downloads & Stability**
-🧠 *Focus:* Intelligent automation and bug fixes  
-- Auto-select best format (max resolution)  
-- Auto-create subfolders per playlist  
-- Resume interrupted downloads  
-- Batch resolution limit (≤1080p, etc.)  
-- Auto-rename invalid filenames  
-- Sequential download queue  
-- 🐞 Fix: Batch download issue  
-- 🐞 Fix: Long video names cut off in Single Download  
+| Version | Focus | Highlights |
+|----------|--------|------------|
+| **v1.2.3** | UX Polish | Queue management, retry logic, smart metadata caching |
+| **v1.3.0** | Integrations | Subtitle download, multi-format presets |
+| **v1.4.0** | AI Assist | Smart name cleanup & auto-tagging |
 
 ---
 
-### **v1.4 – UI / UX Overhaul**
-🎨 *Focus:* Modern look and better usability  
-- Modern progress HUD overlay with ETA  
-- In-app toast center (view last 5 notifications)  
-- Adaptive layout for small screens  
-- Rounded thumbnail previews in history  
-- Quick action buttons beside history items  
-  - ▶️ Open in browser  
-  - 🔁 Re-download  
-  - 🗑️ Remove  
+## 🧩 Tech Stack
 
----
-
-### **v1.5 – Power Tools & Automation**
-🧰 *Focus:* Expanding Clipster’s capabilities  
-- Audio-only extraction (MP3 / M4A) with thumbnail embed  
-- Batch audio conversion (MP4 → MP3 via FFmpeg)  
-- Clipboard auto-detect for YouTube URLs  
-- Auto-fetch metadata on paste  
-- Download completion sound/toast with thumbnail  
-
----
-
-### **Future Ideas (v1.6+)**
-💡 *Clipster Pro Vision*  
-- Auto-update via GitHub API  
-- Cloud sync for settings/history  
-- Theme toggle (Light/Dark)  
-- Plug-in system for other sites (Vimeo, SoundCloud)  
-
----
-
-## 🧰 Tech Stack
 - **Language:** Python 3.13  
-- **UI Framework:** CustomTkinter  
-- **Backend Tools:** yt-dlp, FFmpeg  
-- **Platform:** Windows 10/11  
-- **Packaging:** PyInstaller (OneFile Executable)
+- **GUI:** [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter)  
+- **Downloader:** [yt-dlp](https://github.com/yt-dlp/yt-dlp)  
+- **Media Tools:** FFmpeg suite  
+- **Packaging:** PyInstaller  
 
 ---
 
-## 🧑‍💻 Developer Notes
-- Store `yt-dlp.exe` and `ffmpeg.exe` in the `Assets/` folder (auto-handled in packaged build).  
-- Supports drag-and-drop URLs.  
-- Smooth startup animation and minimized flicker.  
+## 🧾 License
+
+Licensed under the **MIT License**.  
+Copyright © 2025  
+Developed by **Nisarg Panchal**
 
 ---
 
-## 📜 Changelog
-See [CHANGELOG.md](./CHANGELOG.md) for a full version history.
-
----
-
-## ❤️ Credits
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp)  
-- [FFmpeg](https://ffmpeg.org/)  
-- [CustomTkinter](https://github.com/TomSchimansky/CustomTkinter)
-
----
-
-## 📢 License
-This project is licensed under the **MIT License** — free for personal and commercial use.
-
----
-
-> **Clipster v1.2.1** — Smart, fast, and stylish YouTube downloader.  
-> *Next milestone: v1.3 Smart Download Update 🚀*
+> 🧡 A passion project for speed, stability, and simplicity.

@@ -13,6 +13,13 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
 
+import tempfile
+import errno
+import functools
+import concurrent.futures
+from time import monotonic
+
+
 import requests
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
@@ -71,6 +78,61 @@ def check_latest_version():
         log_message(f"Update check failed: {e}")
 
 
+def run_subprocess_safe(cmd, timeout=300, cwd=None, capture_output=True):
+    """
+    Run subprocess in a consistent way, capture stdout/stderr, return dict:
+    { 'returncode': int, 'stdout': str, 'stderr': str, 'timed_out': bool }
+    """
+    try:
+        popen_kwargs = {"stdout": subprocess.PIPE if capture_output else None,
+                        "stderr": subprocess.PIPE if capture_output else None,
+                        "text": True}
+        if _is_windows():
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = subprocess.SW_HIDE
+            popen_kwargs["startupinfo"] = si
+            popen_kwargs["creationflags"] = 0x08000000
+        proc = subprocess.Popen(cmd, cwd=cwd, **popen_kwargs)
+        try:
+            out, err = proc.communicate(timeout=timeout)
+            return {"returncode": proc.returncode, "stdout": out or "", "stderr": err or "", "timed_out": False}
+        except subprocess.TimeoutExpired:
+            try:
+                proc.terminate()
+                time.sleep(0.2)
+                proc.kill()
+            except Exception:
+                pass
+            return {"returncode": None, "stdout": "", "stderr": "Timed out", "timed_out": True}
+    except Exception as e:
+        return {"returncode": None, "stdout": "", "stderr": str(e), "timed_out": False}
+        
+
+# --------------------------------------------
+# Helpers: Sanitize filenames
+# --------------------------------------------
+
+_SAFE_FILENAME_RE = re.compile(r'[^A-Za-z0-9 ._\-()]')
+
+def safe_filename(name: str, max_len=200, default="file"):
+    if not name:
+        return default
+    name = str(name)
+    # replace illegal characters
+    cleaned = _SAFE_FILENAME_RE.sub("_", name)
+    # collapse repeated underscores
+    cleaned = re.sub(r'_{2,}', '_', cleaned).strip(" _")
+    if not cleaned:
+        return default
+    # trim length but preserve extension if present
+    if len(cleaned) > max_len:
+        base, ext = os.path.splitext(cleaned)
+        keep = max_len - len(ext)
+        cleaned = base[:keep] + ext
+    return cleaned
+
+
 # --------------------------------------------
 # Helpers: log & filesystem checks
 # --------------------------------------------
@@ -81,6 +143,18 @@ def log_message(msg: str):
             f.write(f"[{now_str()}] {msg}\n")
     except Exception:
         pass
+
+def log_debug(msg):
+    try:
+        settings = None
+        # If app exists on module level, try to read debug flag
+        if 'app' in globals() and getattr(globals()['app'], 'settings', None):
+            settings = globals()['app'].settings
+        if settings and settings.get("debug_mode"):
+            log_message("[DEBUG] " + msg)
+    except Exception:
+        log_message("[DEBUG] " + msg)
+
 
 def open_log_file():
     """Open the Clipster log file in the default text editor (Windows)."""
@@ -109,6 +183,7 @@ def check_executables():
 # Settings & History JSON
 # --------------------------------------------
 DEFAULT_SETTINGS = {
+    "debug_mode": False,
     "default_format": "mp4",
     "theme": "dark",
     "embed_thumbnail": True,
@@ -137,31 +212,26 @@ def load_settings():
         return DEFAULT_SETTINGS.copy()
 
 def save_settings(settings):
-    """Save settings to JSON file."""
     try:
-        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-            json.dump(settings, f, indent=2)
+        ok = safe_write_json(SETTINGS_FILE, settings)
+        if not ok:
+            log_message("save_settings: safe_write_json returned False")
     except Exception as e:
         log_message(f"Failed to save settings: {e}")
 
+
 def load_history():
-    """Load download history from JSON file."""
-    if not HISTORY_FILE.exists():
-        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump([], f)
+    data = safe_read_json(HISTORY_FILE, default=[])
+    if data is None:
         return []
-    try:
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return []
+    return data
+
 
 def append_history(entry):
-    """Append a new entry to the history JSON."""
-    history = load_history()
+    history = load_history() or []
     history.insert(0, entry)
-    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(history, f, indent=2)
+    safe_write_json(HISTORY_FILE, history)
+
 
 def delete_history_entry(index):
     """Delete a specific entry from history."""
@@ -194,6 +264,93 @@ def is_youtube_url(url):
 def now_str():
     """Get current datetime as string."""
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+# ---------- Atomic JSON write/read with optional file lock ----------
+_FILE_LOCK_TIMEOUT = 5.0  # seconds for lock attempts
+
+def _acquire_file_lock(lock_path, timeout=_FILE_LOCK_TIMEOUT):
+    """
+    Best-effort cross-process lock:
+    Try to create a lock file atomically (O_CREAT|O_EXCL).
+    Return a file descriptor which should be closed/unlinked by caller.
+    If can't acquire within timeout, raise TimeoutError.
+    """
+    start = monotonic()
+    while True:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            # write pid for debugging
+            try:
+                os.write(fd, str(os.getpid()).encode("utf-8"))
+            except Exception:
+                pass
+            return fd
+        except OSError as e:
+            if e.errno != errno.EEXIST:
+                raise
+            if monotonic() - start > timeout:
+                raise TimeoutError(f"Could not acquire lock {lock_path}")
+            time.sleep(0.05)
+
+def _release_file_lock(fd, lock_path):
+    try:
+        os.close(fd)
+    except Exception:
+        pass
+    try:
+        os.unlink(lock_path)
+    except Exception:
+        pass
+
+def safe_write_json(path: Path, data, *, lock_suffix=".lock"):
+    """Write JSON atomically using tempfile + os.replace with optional lock."""
+    path = Path(path)
+    lock_path = str(path) + lock_suffix
+    fd = None
+    try:
+        try:
+            fd = _acquire_file_lock(lock_path)
+        except TimeoutError:
+            # fallback to in-process lock only (best-effort)
+            log_message(f"safe_write_json: lock timeout for {path}, proceeding without lock")
+            fd = None
+
+        # write to temp file in same dir to ensure os.replace is atomic
+        dirpath = path.parent
+        dirpath.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=str(dirpath), delete=False) as tf:
+            json.dump(data, tf, indent=2, ensure_ascii=False)
+            tf.flush()
+            os.fsync(tf.fileno())
+            tmpname = tf.name
+        os.replace(tmpname, str(path))
+        return True
+    except Exception as e:
+        log_message(f"safe_write_json failed for {path}: {e}")
+        try:
+            if 'tmpname' in locals() and os.path.exists(tmpname):
+                os.unlink(tmpname)
+        except Exception:
+            pass
+        return False
+    finally:
+        if fd:
+            try:
+                _release_file_lock(fd, lock_path)
+            except Exception:
+                pass
+
+def safe_read_json(path: Path, default=None, *, lock_suffix=".lock"):
+    """Read JSON file; if it fails return default. We don't lock on read to avoid contention."""
+    try:
+        if not Path(path).exists():
+            return default
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log_message(f"safe_read_json failed for {path}: {e}")
+        return default
+
 
 # ------------------ Toast / notification helpers (add after now_str) ------------------
 def _is_windows():
@@ -303,6 +460,8 @@ class DownloadProcess:
     def __init__(self):
         self.proc = None
         self._lock = threading.Lock()
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=6)
+
 
     def start_download(self, url, outdir, filename_template, format_selector, cookies_path=None, progress_callback=None, finished_callback=None, error_callback=None):
         """Start a download thread."""
@@ -575,6 +734,16 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
 class ClipsterApp:
+
+    missing = check_executables()
+    if missing:
+        _toast(app, f"Missing executables: {', '.join(missing)}", title="Missing Assets", level="error", timeout=6000)
+        try:
+            app.single_download_btn.configure(state="disabled")
+            app.single_cancel_btn.configure(state="disabled")
+        except Exception:
+            pass
+
     """Main application class for Clipster GUI."""
     def __init__(self, root):
         self.root = root
@@ -627,11 +796,32 @@ class ClipsterApp:
         try:
             missing = check_executables()
             if missing:
-                # use toast + log rather than blocking messagebox at startup
                 _toast(self, f"Missing executables: {', '.join(missing)}", title="Assets")
                 log_message(f"Missing executables: {missing}")
+                # disable buttons that require executables
+                def disable_controls():
+                    # single tab download buttons
+                    try:
+                        self.single_download_btn.configure(state="disabled")
+                    except Exception:
+                        pass
+                    try:
+                        self.single_cancel_btn.configure(state="disabled")
+                    except Exception:
+                        pass
+                    # ffplay preview
+                    try:
+                        # store missing set to check before preview
+                        self._missing_exes = set(missing)
+                        if "ffplay.exe" in missing:
+                            # you had a preview button in playlist; detect and disable play preview operations
+                            pass
+                    except Exception:
+                        pass
+                self.safe_ui_call(disable_controls)
         except Exception as e:
             log_message(f"_deferred_executables_check error: {e}")
+
 
 
     def _show_window_after_setup(self):
@@ -792,8 +982,46 @@ class ClipsterApp:
         self.root.iconify()
 
     def _close_window(self):
-        """Close the application."""
-        self.root.destroy()
+        try:
+            self.graceful_shutdown()
+        except Exception:
+            pass
+        try:
+            self.root.quit()
+            self.root.destroy()
+        except Exception:
+            pass
+
+    def graceful_shutdown(self, timeout=5):
+        """Cancel active downloads, stop workers, clean temp files."""
+        try:
+            self.current_task_cancelled = True
+            try:
+                self.download_proc.cancel()
+            except Exception:
+                pass
+            # shut down executor
+            if getattr(self, "_executor", None):
+                self._executor.shutdown(wait=False)
+                # wait a short time
+                start = monotonic()
+                while monotonic() - start < timeout:
+                    if self._executor._work_queue.empty():
+                        break
+                    time.sleep(0.05)
+        except Exception as e:
+            log_message(f"graceful_shutdown: {e}")
+        # optional: remove temp files older than X
+        try:
+            for p in TEMP_DIR.iterdir():
+                try:
+                    if p.is_file() and (time.time() - p.stat().st_mtime) > 60*60*24:  # older than 24h
+                        p.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
 
     def _animate_window(self, action="show"):
         """Animate window show/hide using Windows API."""
@@ -1283,7 +1511,11 @@ class ClipsterApp:
                 except Exception:
                     self.ui_queue.put(("history_thumb_ready", i, None))
 
-            threading.Thread(target=thumb_task, args=(idx, entry), daemon=True).start()
+            #threading.Thread(target=thumb_task, args=(idx, entry), daemon=True).start()
+            if getattr(self, "_executor", None):
+                self._executor.submit(thumb_task, idx, entry)
+            else:
+                threading.Thread(target=thumb_task, args=(idx, entry), daemon=True).start()
 
     def _create_history_row(self, idx, entry):
         """Create a row for history item."""
@@ -1532,7 +1764,10 @@ class ClipsterApp:
                 self.ui_queue.put(("meta_fetched", meta, sorted_res, str(thumb_local) if thumb_local else None))
             except Exception as e:
                 self.ui_queue.put(("meta_error", str(e)))
-        threading.Thread(target=task, daemon=True).start()
+        if getattr(self, "_executor", None):
+            self._executor.submit(task)
+        else:
+            threading.Thread(target=task, daemon=True).start()
 
     def on_single_download(self):
         """Start download for single video."""
@@ -1730,7 +1965,12 @@ class ClipsterApp:
                 log_message(f"Playlist fetch error: {e}")
                 self.ui_queue.put(("playlist_error", str(e)))
 
-        threading.Thread(target=task, daemon=True).start()
+        if getattr(self, "_executor", None):
+            self._executor.submit(task)
+        else:
+            threading.Thread(target=task, daemon=True).start()
+
+
 
     def on_download_playlist(self):
         """Download selected playlist items in order."""
@@ -2002,6 +2242,25 @@ class ClipsterApp:
         def error_callback(err):
             self.ui_queue.put(("redownload_error", str(err)))
         self.download_proc.start_download(url, outdir, "%(title)s.%(ext)s", fmt_selector, cookies_path, progress_callback, finished_callback, error_callback)
+
+    def safe_ui_call(self, func, *args, **kwargs):
+        """Schedule a UI call on mainloop thread but guard against destroyed widgets."""
+        try:
+            if not getattr(self, "root", None):
+                return
+            def _wrapped():
+                try:
+                    func(*args, **kwargs)
+                except Exception as e:
+                    log_message(f"safe_ui_call wrapped function error: {e}")
+            try:
+                self.root.after(0, _wrapped)
+            except Exception:
+                # fallback synchronous attempt
+                _wrapped()
+        except Exception:
+            pass
+
 
     def cancel_download(self):
         """Cancel current download."""
@@ -2283,7 +2542,10 @@ class ClipsterApp:
                     self.ui_queue.put(("playlist_thumb_ready", vid, str(target) if target.exists() else None))
                 except Exception:
                     self.ui_queue.put(("playlist_thumb_ready", e.get("id"), None))
-            threading.Thread(target=thumb_task, args=(entry,), daemon=True).start()
+            if getattr(self, "_executor", None):
+                self._executor.submit(thumb_task, entry)
+            else:
+                threading.Thread(target=thumb_task, args=(entry,), daemon=True).start()
             return
 
         if ev == "playlist_fetch_done":

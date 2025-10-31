@@ -4,6 +4,30 @@ All notable changes to **Clipster** will be documented in this file.
 
 ---
 
+## 📦 v1.2.2 — *Stable & Thread-Safe Core* (November 2025)
+
+### 🧠 Under-the-Hood Improvements
+- 🔒 **Thread-safe JSON handling** — Settings and History now use atomic file writes and file locks to prevent corruption.
+- 🧵 **Bounded threading** — All background work now runs through a **ThreadPoolExecutor**, eliminating unbounded thread creation.
+- 🚦 **UI-safe threading model** — Every background task now communicates with the main thread via a **UI queue**, ensuring zero `tkinter` thread violations.
+- 🧩 **Graceful shutdown** — Cancels active downloads, safely shuts down worker threads, and cleans temporary files before exit.
+- ⚙️ **Robust subprocess handling** — All `yt-dlp` and `FFmpeg` calls now run with strict error checking, timeouts, and safe stderr capture.
+- 🪶 **Improved stability under heavy load** — No more random UI freezes or orphaned threads when fetching large playlists.
+
+### ✨ Enhancements
+- 🪄 Unified **thumbnail downloads** under the thread pool for consistent performance.
+- 🧾 Added `"debug_mode"` in settings for detailed logging (optional toggle in future versions).
+- 💬 `safe_ui_call()` and `log_debug()` utilities for cleaner internal logic.
+- 🎨 Minor UI polish — smoother shutdown transitions and safer toast handling.
+
+### 🐞 Bug Fixes
+- 🧯 Fixed rare race condition when saving history after multiple downloads.
+- 🧹 Prevented “zombie” threads if multiple metadata fetches are triggered quickly.
+- 📁 Ensured temporary thumbnail files are cleaned up after embedding.
+- ✅ Fixed potential UI crashes during rapid theme switching or shutdown.
+
+---
+
 ## 📦 v1.2.1 — *Faster, Smarter, Cleaner* (October 2025)
 
 ### ✨ New Features
