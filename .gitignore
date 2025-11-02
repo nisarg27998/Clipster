@@ -1,22 +1,56 @@
-# Byte-compiled / cache
+# ─────────────────────────────────────────────
+# Python cache and compiled files
+# ─────────────────────────────────────────────
 __pycache__/
 *.py[cod]
+*.pyo
+*.pyd
+*.pdb
 
-# Logs and temp files
+# ─────────────────────────────────────────────
+# Logs and temporary files
+# ─────────────────────────────────────────────
 clipster.log
 *.log
 temp/
 downloads/
+*.tmp
+*.bak
 
+# ─────────────────────────────────────────────
+# Build artifacts (PyInstaller, dist, etc.)
+# ─────────────────────────────────────────────
+build/
+dist/
+*.spec
+
+# ─────────────────────────────────────────────
 # Virtual environments
+# ─────────────────────────────────────────────
 .venv/
 env/
 venv/
 
-# System files
+# ─────────────────────────────────────────────
+# System and editor files
+# ─────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+.idea/
+.vscode/
+*.swp
 
+# ─────────────────────────────────────────────
 # Executables and binaries
+# ─────────────────────────────────────────────
 *.exe
 Assets/*.exe
+
+# ─────────────────────────────────────────────
+# Include these explicitly in the repo
+# ─────────────────────────────────────────────
+!version_info.txt
+!README.md
+!CHANGELOG.md
+!Assets/clipster.ico
+!Assets/clipster.png
