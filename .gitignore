@@ -8,6 +8,12 @@ __pycache__/
 *.pdb
 
 # ─────────────────────────────────────────────
+# App user data (should not be tracked)
+# ─────────────────────────────────────────────
+history.json
+settings.json
+
+# ─────────────────────────────────────────────
 # Logs and temporary files
 # ─────────────────────────────────────────────
 clipster.log
