@@ -1,6 +1,33 @@
 # 🧾 Changelog
 
-All notable changes to **Clipster** will be documented in this file.
+All notable changes to **Clipster** are documented here.
+
+---
+
+## 📦 v1.2.3 — *Refined, Reliable, and Polished* (November 2025)
+
+### ⚡ Core Improvements
+- 🧩 **Sequential Batch Downloader** — fixed previous “no download” issue; downloads now process one-by-one with proper progress updates.
+- 📺 **Playlist Progress Bar** — now always visible and dynamically updates during downloads.
+- 🧾 **Long Title Handling** — wrapped and multi-line display for lengthy YouTube titles in the Single tab.
+- 💾 **Disk-Space Check** before every download; warns if free space < 500 MB.
+- 🚦 **Smarter Error Handling** — cleaner `yt-dlp` errors and recovery logic for playlist fetches.
+- 🧱 **Thread-safe & Stable Core** — all background tasks run through controlled executors and a main-thread-safe queue.
+- 🧹 **Removed “Embed Thumbnail” feature** (simplified UI and improved performance).
+
+### 🎨 UI & UX Enhancements
+- 🪄 Improved **Mica titlebar stability** and theme responsiveness.
+- 🧾 **Cleaner toasts** with dynamic theme colors.
+- 🗂️ **History tab thumbnails** now load asynchronously via thread pool.
+- 🧱 **Settings reset bug fixed** — combo boxes now use `.set()` correctly.
+- 💬 **Simpler shutdown experience** — no console flicker or window lag.
+
+### 🐞 Fixes
+- ✅ Fixed **Batch Downloader not working**.
+- ✅ Fixed **Playlist “Overall Progress”** not showing.
+- ✅ Fixed **Settings reset error** (`delete/insert` on combo box).
+- ✅ Fixed potential `AttributeError` from missing embed vars.
+- ✅ Cleaned unused internal thread executor.
 
 ---
 

@@ -8,26 +8,28 @@
 
 ## ✨ Features
 
-- 🎞️ **Single / Batch / Playlist** downloads
-- 🖼️ **Automatic thumbnail embedding**
-- 🧱 **Thread-safe architecture** — No UI freezes, no crashes
+- 🎞️ **Single / Batch / Playlist** downloads (stable & sequential)
+- 🧱 **Thread-safe architecture** — no UI freezes or crashes
 - 💾 **Persistent settings and history**
 - ⚙️ **Format & resolution selection** (MP4, MKV, WEBM, M4A)
 - 🎨 **Windows 11 Mica interface**
 - 🌙 **Dark / Light theme support**
 - 🔔 **Toast notifications** for background updates
 - 🔄 **Auto-update check** from GitHub
+- 💾 **Disk-space check** before downloads
+- 📺 **Wrapped long titles** for clean layout
 
 ---
 
-## 🧠 New in v1.2.2 — *Stable & Thread-Safe Core*
+## 🧠 New in v1.2.3 — *Refined, Reliable, and Polished*
 
-- 🔒 Atomic and thread-safe **settings/history writes**
-- 🧵 Background operations managed via **ThreadPoolExecutor**
-- 🪶 Smarter, cleaner **shutdown logic**
-- 🧩 Robust **yt-dlp** and **FFmpeg** subprocess handling
-- 🧾 Optional **debug logging mode**
-- 🪄 Unified **UI-safe event handling** via internal queue
+- ⚡ Fixed **Batch Downloader** — now runs sequentially and reliably.  
+- 📺 Fixed **Playlist Progress Bar** visibility and updates.  
+- 🧾 Added **long title wrapping** in Single tab.  
+- 💾 Added **disk-space warning** (below 500 MB).  
+- 🧩 Removed **Embed Thumbnail** feature for a cleaner UI.  
+- 🧱 Core refactor: thread-safe workers, UI-safe queue, and better error recovery.  
+- 🧹 Polished shutdown and toast handling.
 
 ---
 
@@ -58,7 +60,6 @@ No setup required — just download the latest `.exe` release:
 
 | Version | Focus | Highlights |
 |----------|--------|------------|
-| **v1.2.3** | UX Polish | Queue management, retry logic, smart metadata caching |
 | **v1.3.0** | Integrations | Subtitle download, multi-format presets |
 | **v1.4.0** | AI Assist | Smart name cleanup & auto-tagging |
 
