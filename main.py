@@ -1503,7 +1503,16 @@ class ClipsterApp:
         self.batch_format_combo = ctk.CTkComboBox(bottom, values=ALLOWED_FORMATS, height=36, corner_radius=8)
         self.batch_format_combo.set(self.settings.get("default_format", "mp4"))
         self.batch_format_combo.pack(side="left", padx=6)
-        ctk.CTkButton(bottom, text="Download Batch", fg_color=ACCENT_COLOR, height=36, corner_radius=8, command=self.on_batch_download)
+        ctk.CTkButton(
+            bottom,
+            text="Download Batch",
+            fg_color=ACCENT_COLOR,
+            height=36,
+            corner_radius=8,
+            command=self.on_batch_download
+        ).pack(side="right", padx=6)
+
+
 
         ctk.CTkLabel(
             frame,
@@ -2004,6 +2013,7 @@ class ClipsterApp:
             threading.Thread(target=task, daemon=True).start()
 
     def on_single_download(self):
+        import shutil
         """Start download for single video."""
         url = self.single_url_entry.get().strip()
         if not url:
@@ -2046,6 +2056,7 @@ class ClipsterApp:
         self.download_proc.start_download(url, outdir, filename_template, fmt_selector, cookies_path, progress_callback, finished_callback, error_callback)
 
     def on_batch_download(self):
+        import shutil
         """Start batch download (sequential & stable)."""
         raw = self.batch_text.get("0.0", "end").strip()
         if not raw:
