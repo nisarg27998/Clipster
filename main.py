@@ -3,11 +3,11 @@ import sys
 import re
 import json
 import time
-import shutil
+
 import queue
 import threading
 import subprocess
-import webbrowser
+
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
@@ -15,11 +15,11 @@ from urllib.parse import urlparse, parse_qs
 import tempfile
 import errno
 import functools
-import concurrent.futures
+
 from time import monotonic
 
 
-import requests
+
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
@@ -29,10 +29,15 @@ from PIL import Image
 # Branding / Config
 # --------------------------------------------
 APP_NAME = "Clipster"
-APP_VERSION = "1.2.3"
+APP_VERSION = "1.2.4"
 ACCENT_COLOR = "#0078D7"
 SECONDARY_COLOR = "#00B7C2"
 SPLASH_TEXT = "Fetch. Download. Enjoy."
+
+GITHUB_REPO = "nisarg27998/Clipster"
+GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+GITHUB_RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
+
 
 BASE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = BASE_DIR / "Assets"
@@ -58,21 +63,6 @@ LOG_FILE = BASE_DIR / "clipster.log"
 # --------------------------------------------
 # Update check (GitHub latest release)
 # --------------------------------------------
-def check_latest_version():
-    """Check GitHub for the latest release version."""
-    try:
-        import requests
-        r = requests.get("https://api.github.com/repos/nisarg27998/Clipster/releases/latest", timeout=5)
-        if r.status_code == 200:
-            latest = r.json().get("tag_name", "")
-            if latest and latest != f"v{APP_VERSION}":
-                messagebox.showinfo(
-                    "Update Available",
-                    f"A newer version ({latest}) of {APP_NAME} is available on GitHub.\n\n"
-                    "Visit the Releases page to download it."
-                )
-    except Exception as e:
-        log_message(f"Update check failed: {e}")
 
 
 def run_subprocess_safe(cmd, timeout=300, cwd=None, capture_output=True):
@@ -111,6 +101,10 @@ def run_subprocess_safe(cmd, timeout=300, cwd=None, capture_output=True):
 # --------------------------------------------
 
 _SAFE_FILENAME_RE = re.compile(r'[^A-Za-z0-9 ._\-()]')
+
+
+
+
 
 def safe_filename(name: str, max_len=200, default="file"):
     if not name:
@@ -352,42 +346,65 @@ def _is_windows():
     return sys.platform.startswith("win")
 
 def show_toast(root, message, title=None, timeout=3000, level="info", theme="dark"):
-    """
-    Non-blocking themed toast. root = main CTk root.
-    timeout in milliseconds (int). level can be "info", "success", "error".
-    """
+    """Non-blocking themed toast with Windows 11 styling."""
     try:
         if not getattr(root, "_toast_enabled", True):
             return
         toast = ctk.CTkToplevel(root)
         toast.overrideredirect(True)
         toast.attributes("-topmost", True)
-        # theme-based colors
+        # Windows 11 acrylic colors
         if theme == "light":
-            bg = "#ffffff"
+            bg = "#f3f3f3"
             fg = "#000000"
         else:
-            bg = "#1b1b1b"
+            bg = "#2b2b2b"
             fg = "#ffffff"
-        # Frame
-        frame = ctk.CTkFrame(toast, fg_color=bg, corner_radius=10, border_width=0)
-        frame.pack(fill="both", expand=True)
-        # Title / icon
+        # Frame with rounded corners (Windows 11 style)
+        frame = ctk.CTkFrame(toast, fg_color=bg, corner_radius=12, border_width=1, 
+                            border_color="#404040" if theme == "dark" else "#d0d0d0")
+        frame.pack(fill="both", expand=True, padx=2, pady=2)
+        
         title_text = title or ""
-        lbl_title = ctk.CTkLabel(frame, text=title_text, anchor="w", font=ctk.CTkFont(size=11, weight="bold"))
+        lbl_title = ctk.CTkLabel(frame, text=title_text, anchor="w", font=ctk.CTkFont(size=12, weight="bold"))
         if title_text:
-            lbl_title.pack(fill="x", padx=12, pady=(8, 0))
+            lbl_title.pack(fill="x", padx=16, pady=(12, 0))
         lbl = ctk.CTkLabel(frame, text=message, anchor="w", font=ctk.CTkFont(size=11))
-        lbl.pack(fill="both", padx=12, pady=(6, 10))
-        # position: bottom-right of main window
+        lbl.pack(fill="both", padx=16, pady=(8, 14))
+        
         try:
-            x = root.winfo_x() + root.winfo_width() - 320 - 16
-            y = root.winfo_y() + root.winfo_height() - 120 - 16
-            toast.geometry(f"320x86+{x}+{y}")
+            x = root.winfo_x() + root.winfo_width() - 340 - 20
+            y = root.winfo_y() + root.winfo_height() - 110 - 20
+            toast.geometry(f"340x90+{x}+{y}")
         except Exception:
-            toast.geometry("320x86+100+100")
-        # auto-destroy
-        toast.after(timeout, lambda: (toast.destroy()))
+            toast.geometry("340x90+100+100")
+        
+        # Fade in effect
+        toast.attributes("-alpha", 0.0)
+        def fade_in(alpha=0.0):
+            if alpha < 0.95:
+                alpha += 0.1
+                toast.attributes("-alpha", alpha)
+                toast.after(20, lambda: fade_in(alpha))
+            else:
+                toast.attributes("-alpha", 0.95)
+        fade_in()
+        
+        # Auto-destroy with fade out
+        def fade_out(alpha=0.95):
+            if alpha > 0:
+                alpha -= 0.1
+                try:
+                    toast.attributes("-alpha", alpha)
+                    toast.after(20, lambda: fade_out(alpha))
+                except:
+                    pass
+            else:
+                try:
+                    toast.destroy()
+                except:
+                    pass
+        toast.after(timeout, lambda: fade_out())
     except Exception:
         pass
 
@@ -458,11 +475,8 @@ class DownloadProcess:
         
 
     def shutdown(self):
-        """Shutdown internal executor."""
-        try:
-            self._executor.shutdown(wait=False)
-        except Exception:
-            pass
+        
+        pass
 
     def start_download(self, url, outdir, filename_template, format_selector, cookies_path=None, progress_callback=None, finished_callback=None, error_callback=None):
         """Start a download thread."""
@@ -540,9 +554,6 @@ class DownloadProcess:
         except Exception as e:
             if error_callback:
                 error_callback(str(e))
-        else:
-                if line and not match:
-                    log_debug(f"Unparsed yt-dlp line: {line}")
         finally:
             with self._lock:
                 self.proc = None
@@ -563,6 +574,7 @@ class DownloadProcess:
 # Thumbnail download & embed (ffmpeg)
 # --------------------------------------------
 def download_thumbnail(url, target_filename=None, timeout=20):
+    import requests, shutil
     """Download thumbnail from URL to user's Downloads folder."""
     try:
         downloads_path = str(Path.home() / "Downloads")
@@ -740,8 +752,14 @@ ctk.set_default_color_theme("blue")
 
 class ClipsterApp:
 
+    def run_bg(self, func, *args):
+        if getattr(self, "_executor", None):
+            self._executor.submit(func, *args)
+
+
     """Main application class for Clipster GUI."""
     def __init__(self, root):
+        import concurrent.futures
         self.root = root
 
         # enable toasts on root
@@ -763,7 +781,7 @@ class ClipsterApp:
 
 
         self.settings = load_settings()
-        self.history = load_history()
+        self.history = []  # Defer history loading
 
         ctk.set_appearance_mode(self.settings.get("theme", "dark"))
 
@@ -778,16 +796,90 @@ class ClipsterApp:
         self._playlist_row_by_vid = {}
         self._playlist_row_order = []
 
-        # drag ghost and state
-        self._drag_source_row = None
-        self._drag_ghost = None
+
 
         self._build_ui()
         self._enable_mica_effect()
         self.root.after(100, self._process_ui_queue)
 
         # Show window after setup to avoid flashing
-        self.root.after(200, self._show_window_after_setup)
+        self.root.after(100, self._show_window_after_setup)
+
+    def _check_for_updates(self):
+        """Check GitHub API for newer releases."""
+        import requests
+        try:
+            self.update_status_label.configure(text="Checking GitHub...")
+            r = requests.get(GITHUB_API_LATEST, timeout=6)
+            if r.status_code != 200:
+                self.update_status_label.configure(text=f"Failed to fetch release info ({r.status_code})")
+                return
+            data = r.json()
+            latest = data.get("tag_name", "").lstrip("v")
+            if not latest:
+                self.update_status_label.configure(text="No valid release found.")
+                return
+            if latest == APP_VERSION:
+                self.update_status_label.configure(text=f"✅ You’re running the latest version ({APP_VERSION}).")
+            else:
+                self.update_status_label.configure(
+                    text=f"🆕 New version available: {latest}\n(Current: {APP_VERSION})"
+                )
+                self.latest_release_data = data
+        except Exception as e:
+            self.update_status_label.configure(text=f"Failed to check updates: {e}")
+        
+
+    def _check_update_button(self):
+        threading.Thread(target=self._check_for_updates, daemon=True).start()
+
+    def _download_and_install_update(self):
+        import requests
+        import shutil
+        """Download latest EXE and replace the current one."""
+        try:
+            data = getattr(self, "latest_release_data", None)
+            if not data:
+                messagebox.showinfo(APP_NAME, "Please check for updates first.")
+                return
+            assets = data.get("assets", [])
+            exe_url = None
+            for asset in assets:
+                if asset["name"].endswith(".exe"):
+                    exe_url = asset["browser_download_url"]
+                    break
+            if not exe_url:
+                messagebox.showinfo(APP_NAME, "No .exe found in latest release assets.")
+                return
+
+            try: self.show_spinner("Downloading latest version...")
+            except Exception: pass
+            new_exe_path = TEMP_DIR / "Clipster_Update.exe"
+            with requests.get(exe_url, stream=True, timeout=30) as r:
+                r.raise_for_status()
+                total = int(r.headers.get("Content-Length", 0))
+                with open(new_exe_path, "wb") as f:
+                    downloaded = 0
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total:
+                            percent = downloaded * 100 // total
+                            self.update_status_label.configure(text=f"Downloading... {percent}%")
+
+            try: self.hide_spinner()
+            except Exception: pass
+            self.update_status_label.configure(text="✅ Download complete. Installing update...")
+
+            # Run new exe and exit current app
+            os.startfile(str(new_exe_path))
+            self._close_window()
+
+        except Exception as e:
+            self.hide_spinner()
+            messagebox.showerror(APP_NAME, f"Update failed: {e}")
 
     def _deferred_executables_check(self):
         try:
@@ -1003,7 +1095,11 @@ class ClipsterApp:
                 pass
             # shut down executor
             if getattr(self, "_executor", None):
-                self._executor.shutdown(wait=False)
+                try:
+                    self._executor.shutdown(wait=False)
+                except Exception:
+                    pass
+                self._executor = None
                 # wait a short time
                 start = monotonic()
                 while monotonic() - start < timeout:
@@ -1052,13 +1148,7 @@ class ClipsterApp:
             return None
 
     def _path_exists(self, p):
-        """Check if path exists."""
-        try:
-            if not p:
-                return False
-            return Path(str(p)).exists()
-        except Exception:
-            return False
+        return Path(str(p)).exists() if p else False
 
     def _set_label_image_from_path(self, label, path, size=(160, 90), fallback_text="No thumbnail"):
         """Set CTkLabel image from path."""
@@ -1084,19 +1174,6 @@ class ClipsterApp:
                 pass
             return False
         
-    def _recreate_drag_ghost(self):
-        """Ensure drag ghost matches current accent color and theme."""
-        try:
-            if self._drag_ghost:
-                try:
-                    self._drag_ghost.destroy()
-                except Exception:
-                    pass
-            self._drag_ghost = ctk.CTkFrame(self.playlist_scroll, height=6, fg_color=ACCENT_COLOR)
-            # not packed now — created fresh
-        except Exception:
-            self._drag_ghost = None
-
     def _apply_theme(self):
         """Apply theme to the application. (override to recreate drag ghost to avoid desync)"""
         ctk.set_appearance_mode(self.settings.get("theme", "dark"))
@@ -1107,11 +1184,6 @@ class ClipsterApp:
         self.refresh_history()
         self._update_titlebar_theme()
         self._enable_mica_effect()
-        # recreate drag ghost to avoid desync
-        try:
-            self._recreate_drag_ghost()
-        except Exception:
-            pass
         self.root.update_idletasks()
 
     def _on_theme_combo_changed(self, choice):
@@ -1180,11 +1252,19 @@ class ClipsterApp:
         # Add buttons
         for val in values:
             btn = ctk.CTkButton(
-                menu_win, text=val, fg_color="transparent", hover_color=hover_color, anchor="w",
-                width=parent_widget.winfo_width() - 8, height=28,
+                menu_win, 
+                text=val, 
+                fg_color="transparent", 
+                hover_color=hover_color, 
+                anchor="w",
+                width=parent_widget.winfo_width() - 8, 
+                height=32, 
+                corner_radius=8,  # ADD corner_radius=8
                 command=lambda v=val: (on_select(v), menu_win.destroy())
             )
             btn.pack(fill="x", padx=6, pady=2)
+
+        
 
         # Fade in
         alpha_step = 0.08
@@ -1237,8 +1317,16 @@ class ClipsterApp:
         # Add items
         for label, callback in items:
             btn = ctk.CTkButton(
-                menu_win, text=label, fg_color="transparent", hover_color=hover_color, anchor="w",
-                width=180, height=28, command=lambda c=callback, m=menu_win: (m.destroy(), c())
+                menu_win, 
+                text=label, 
+                fg_color="transparent", 
+                hover_color=hover_color, 
+                anchor="w",
+                width=180, 
+                height=32, 
+                corner_radius=8,  # ADD corner_radius=8
+                command=lambda c=callback, 
+                m=menu_win: (m.destroy(), c())
             )
             btn.pack(fill="x", padx=8, pady=2)
 
@@ -1263,20 +1351,16 @@ class ClipsterApp:
         except Exception as e:
             log_message(f"_create_titlebar failed: {e}")
 
-        #top_frame = ctk.CTkFrame(self.root, corner_radius=0)
-        #top_frame.pack(fill="x", padx=12, pady=(12, 6))
-        #title_lbl = ctk.CTkLabel(top_frame, text=APP_NAME, font=ctk.CTkFont(size=20, weight="bold"))
-        #title_lbl.pack(side="left", padx=8)
-        #splash_lbl = ctk.CTkLabel(top_frame, text=SPLASH_TEXT, font=ctk.CTkFont(size=12))
-        #splash_lbl.pack(side="left", padx=12)
-
-        self.tabs = ctk.CTkTabview(self.root, width=980, height=540)
+        self.tabs = ctk.CTkTabview(self.root, width=980, height=540, corner_radius=12)
         self.tabs.pack(padx=12, pady=6, fill="both", expand=True)
         self.tabs.add("Single Video")
         self.tabs.add("Batch Downloader")
         self.tabs.add("Playlist Downloader")
         self.tabs.add("History")
         self.tabs.add("Settings")
+        self.tabs.add("Update")
+        self._build_update_tab(self.tabs.tab("Update"))
+
 
         self._build_single_tab(self.tabs.tab("Single Video"))
         self._build_batch_tab(self.tabs.tab("Batch Downloader"))
@@ -1292,50 +1376,59 @@ class ClipsterApp:
     def _build_single_tab(self, parent):
         """Build UI for Single Video tab."""
         pad = 12
-        frame = ctk.CTkFrame(parent)
+        frame = ctk.CTkFrame(parent, corner_radius=12)
         frame.pack(fill="both", expand=True, padx=pad, pady=pad)
-        left = ctk.CTkFrame(frame)
+        left = ctk.CTkFrame(frame, corner_radius=10)
         left.pack(side="left", fill="y", padx=(0, 8), pady=4)
 
-        ctk.CTkLabel(left, text="Video URL:", anchor="w").pack(padx=8, pady=(8, 0))
-        self.single_url_entry = ctk.CTkEntry(left, width=520)
-        self.single_url_entry.pack(padx=8, pady=(4, 8))
+        url_frame = ctk.CTkFrame(left, fg_color="transparent")
+        url_frame.pack(fill="x", padx=8, pady=(8, 4))
+        ctk.CTkLabel(url_frame, text="Video URL:", anchor="w", width=100).pack(side="left", padx=(0, 8))
+        self.single_url_entry = ctk.CTkEntry(url_frame, width=400, height=36, corner_radius=8)
+        self.single_url_entry.pack(side="left", fill="x", expand=True)
 
-        self.fetch_meta_btn = ctk.CTkButton(left, text="Fetch Metadata", fg_color=ACCENT_COLOR, command=self.on_fetch_single_metadata)
+        self.fetch_meta_btn = ctk.CTkButton(left, text="Fetch Metadata", fg_color=ACCENT_COLOR, 
+                                     height=36, corner_radius=8, command=self.on_fetch_single_metadata)
         self.fetch_meta_btn.pack(padx=8, pady=6)
 
-        # Save thumbnail button (disabled until metadata fetched)
-        self.save_thumb_btn = ctk.CTkButton(left, text="Save Thumbnail", fg_color="gray", command=self.on_save_thumbnail)
+        self.save_thumb_btn = ctk.CTkButton(left, text="Save Thumbnail", fg_color="gray", 
+                                            height=36, corner_radius=8, command=self.on_save_thumbnail)
         self.save_thumb_btn.pack(padx=8, pady=(0,6))
         self.save_thumb_btn.configure(state="disabled")
 
-        ctk.CTkLabel(left, text="Resolution:", anchor="w").pack(padx=8, pady=(8, 0))
-        self.single_resolution_combo = ctk.CTkComboBox(left, values=["Best Available"], width=200)
+        res_frame = ctk.CTkFrame(left, fg_color="transparent")
+        res_frame.pack(fill="x", padx=8, pady=(8, 4))
+        ctk.CTkLabel(res_frame, text="Resolution:", anchor="w", width=100).pack(side="left", padx=(0, 8))
+        self.single_resolution_combo = ctk.CTkComboBox(res_frame, values=["Best Available"], width=250, 
+                                                        height=36, corner_radius=8)
         self.single_resolution_combo.set("Best Available")
-        self.single_resolution_combo.pack(padx=8, pady=6)
+        self.single_resolution_combo.pack(side="left")
 
-        ctk.CTkLabel(left, text="Format:", anchor="w").pack(padx=8, pady=(8, 0))
-        self.single_format_combo = ctk.CTkComboBox(left, values=ALLOWED_FORMATS, width=200)
+        fmt_frame = ctk.CTkFrame(left, fg_color="transparent")
+        fmt_frame.pack(fill="x", padx=8, pady=(8, 4))
+        ctk.CTkLabel(fmt_frame, text="Format:", anchor="w", width=100).pack(side="left", padx=(0, 8))
+        self.single_format_combo = ctk.CTkComboBox(fmt_frame, values=ALLOWED_FORMATS, width=250, 
+                                                    height=36, corner_radius=8)
         self.single_format_combo.set(self.settings.get("default_format", "mp4"))
-        self.single_format_combo.pack(padx=8, pady=6)
+        self.single_format_combo.pack(side="left")
 
         
 
         btn_frame = ctk.CTkFrame(left, fg_color="transparent")
         btn_frame.pack(padx=8, pady=(4, 12))
-        self.single_download_btn = ctk.CTkButton(btn_frame, text="Download", fg_color=ACCENT_COLOR, command=self.on_single_download)
+        self.single_download_btn = ctk.CTkButton(btn_frame, text="Download", fg_color=ACCENT_COLOR, height=36, corner_radius=8, command=self.on_single_download)
         self.single_download_btn.pack(side="left", padx=6)
-        self.single_cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", command=self.cancel_download)
+        self.single_cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", height=36, corner_radius=8, command=self.cancel_download)
         self.single_cancel_btn.pack(side="left", padx=6)
 
         ctk.CTkLabel(left, text="Progress:", anchor="w").pack(padx=8, pady=(6, 0))
-        self.single_progress = ctk.CTkProgressBar(left, width=320)
+        self.single_progress = ctk.CTkProgressBar(left, width=320, height=8, corner_radius=4)
         self.single_progress.set(0)
         self.single_progress.pack(padx=8, pady=(4, 8))
         self.single_progress_label = ctk.CTkLabel(left, text="")
         self.single_progress_label.pack(padx=8, pady=(2, 8))
 
-        right = ctk.CTkFrame(frame)
+        right = ctk.CTkFrame(frame, corner_radius=10)
         right.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=4)
 
         self.meta_title_var = ctk.StringVar(value="")
@@ -1354,10 +1447,11 @@ class ClipsterApp:
         self.meta_duration_var = ctk.StringVar(value="")
         ctk.CTkLabel(right, textvariable=self.meta_duration_var, font=ctk.CTkFont(size=12)).pack(anchor="nw", padx=8, pady=2)
 
-        self.thumbnail_label = ctk.CTkLabel(right, text="Thumbnail preview", width=320, height=180, anchor="center")
+        self.thumbnail_label = ctk.CTkLabel(right, text="Thumbnail preview", width=320, height=180, anchor="center", corner_radius=10)
         self.thumbnail_label.pack(anchor="nw", padx=8, pady=12)
 
     def on_save_thumbnail(self):
+        import shutil
         """Save the last fetched thumbnail safely to the configured download folder."""
         try:
             target_dir = Path(self.settings.get("default_download_path", str(DOWNLOADS_DIR)))
@@ -1391,25 +1485,25 @@ class ClipsterApp:
     def _build_batch_tab(self, parent):
         """Build UI for Batch Downloader tab."""
         pad = 12
-        frame = ctk.CTkFrame(parent)
+        frame = ctk.CTkFrame(parent, corner_radius=12)
         frame.pack(fill="both", expand=True, padx=pad, pady=pad)
-        top = ctk.CTkFrame(frame)
+        top = ctk.CTkFrame(frame, corner_radius=10)
         top.pack(fill="x", pady=6)
         ctk.CTkLabel(top, text="Paste multiple video URLs (one per line):").pack(side="left", padx=6)
-        self.batch_maxres_combo = ctk.CTkComboBox(top, values=["Best Available", "720p", "1080p", "1440p", "2160p"], width=180)
+        self.batch_maxres_combo = ctk.CTkComboBox(top, values=["Best Available", "720p", "1080p", "1440p", "2160p"], width=180, height=36, corner_radius=8)
         self.batch_maxres_combo.set("Best Available")
         self.batch_maxres_combo.pack(side="right", padx=6)
 
-        self.batch_text = ctk.CTkTextbox(frame, width=800, height=260)
+        self.batch_text = ctk.CTkTextbox(frame, width=800, height=260, corner_radius=10)
         self.batch_text.pack(padx=6, pady=6, fill="both", expand=True)
 
-        bottom = ctk.CTkFrame(frame)
+        bottom = ctk.CTkFrame(frame, corner_radius=10)
         bottom.pack(fill="x", pady=6)
         ctk.CTkLabel(bottom, text="Format:").pack(side="left", padx=6)
-        self.batch_format_combo = ctk.CTkComboBox(bottom, values=ALLOWED_FORMATS)
+        self.batch_format_combo = ctk.CTkComboBox(bottom, values=ALLOWED_FORMATS, height=36, corner_radius=8)
         self.batch_format_combo.set(self.settings.get("default_format", "mp4"))
         self.batch_format_combo.pack(side="left", padx=6)
-        ctk.CTkButton(bottom, text="Download Batch", fg_color=ACCENT_COLOR, command=self.on_batch_download).pack(side="right", padx=6)
+        ctk.CTkButton(bottom, text="Download Batch", fg_color=ACCENT_COLOR, height=36, corner_radius=8, command=self.on_batch_download)
 
         ctk.CTkLabel(
             frame,
@@ -1419,12 +1513,13 @@ class ClipsterApp:
         ).pack(anchor="w", padx=6, pady=(6, 0))
 
         self.batch_overall_progress = ctk.CTkProgressBar(
-            frame,
-            height=10,
+            frame, 
+            height=8, 
             fg_color="#2E2E2E",
-            progress_color=ACCENT_COLOR,
-            corner_radius=8
+            progress_color=ACCENT_COLOR, 
+            corner_radius=4
         )
+
         self.batch_overall_progress.set(0)
         self.batch_overall_progress.pack(fill="x", padx=6, pady=(0, 10))
 
@@ -1432,23 +1527,33 @@ class ClipsterApp:
     def _build_playlist_tab(self, parent):
         """Build UI for Playlist Downloader tab."""
         pad = 12
-        frame = ctk.CTkFrame(parent)
+        frame = ctk.CTkFrame(parent, corner_radius=12)
         frame.pack(fill="both", expand=True, padx=pad, pady=pad)
 
-        ctk.CTkLabel(frame, text="Playlist URL:").pack(anchor="nw", padx=6, pady=(6, 0))
-        self.playlist_url_entry = ctk.CTkEntry(frame, width=720)
-        self.playlist_url_entry.pack(padx=6, pady=(4, 8))
-        fetch_btn = ctk.CTkButton(frame, text="Fetch Playlist Items", fg_color=ACCENT_COLOR, command=self.on_fetch_playlist)
+        url_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        url_frame.pack(fill="x", padx=6, pady=(6, 4))
+        ctk.CTkLabel(url_frame, text="Playlist URL:", anchor="w", width=100).pack(side="left", padx=(0, 8))
+        self.playlist_url_entry = ctk.CTkEntry(url_frame, width=600, height=36, corner_radius=8)
+        self.playlist_url_entry.pack(side="left", fill="x", expand=True)
+
+        fetch_btn = ctk.CTkButton(
+            frame, 
+            text="Fetch Playlist Items", 
+            fg_color=ACCENT_COLOR, 
+            height=36, 
+            corner_radius=8, 
+            command=self.on_fetch_playlist
+        )
         fetch_btn.pack(padx=6, pady=(4, 8))
 
         self.playlist_progress_label = ctk.CTkLabel(frame, text="", anchor="w")
         self.playlist_progress_label.pack(anchor="nw", padx=6, pady=(4, 0))
 
         ctk.CTkLabel(frame, text="Playlist Items:").pack(anchor="nw", padx=6, pady=(6, 0))
-        self.playlist_scroll = ctk.CTkScrollableFrame(frame, height=280)
+        self.playlist_scroll = ctk.CTkScrollableFrame(frame, height=280, corner_radius=10)
         self.playlist_scroll.pack(fill="both", expand=True, padx=6, pady=(4, 12))
 
-        bottom = ctk.CTkFrame(frame)
+        bottom = ctk.CTkFrame(frame, corner_radius=10)
         bottom.pack(fill="x", pady=6)
         ctk.CTkLabel(bottom, text="Max Resolution:").pack(side="left", padx=6)
         self.playlist_maxres_combo = ctk.CTkComboBox(bottom, values=["Best Available", "720p", "1080p", "1440p", "2160p"], width=180)
@@ -1467,7 +1572,7 @@ class ClipsterApp:
 
         ctk.CTkButton(
             bottom,
-            text="Download Playlist (selected order)",
+            text="Download Playlist",
             fg_color=ACCENT_COLOR,
             command=self.on_download_playlist
         ).pack(side="right", padx=6)
@@ -1496,14 +1601,21 @@ class ClipsterApp:
 
     def _build_history_tab(self, parent):
         """Build UI for History tab."""
-        frame = ctk.CTkFrame(parent)
+        frame = ctk.CTkFrame(parent, corner_radius=12)
         frame.pack(fill="both", expand=True, padx=12, pady=12)
 
-        top = ctk.CTkFrame(frame)
+        top = ctk.CTkFrame(frame, corner_radius=10)
         top.pack(fill="x", pady=(0, 8))
-        ctk.CTkButton(top, text="Clear History", command=self.clear_history_prompt, fg_color="tomato").pack(side="left", padx=6)
+        ctk.CTkButton(
+            top, 
+            text="Clear History", 
+            command=self.clear_history_prompt, 
+            fg_color="tomato", 
+            height=36, 
+            corner_radius=8
+        )
 
-        self.history_scroll = ctk.CTkScrollableFrame(frame, height=480)
+        self.history_scroll = ctk.CTkScrollableFrame(frame, height=480, corner_radius=10)
         self.history_scroll.pack(fill="both", expand=True, padx=6, pady=6)
 
         self.refresh_history()
@@ -1564,12 +1676,28 @@ class ClipsterApp:
             else:
                 threading.Thread(target=thumb_task, args=(idx, entry), daemon=True).start()
 
+    def load_and_render_history(self):
+        """Load history in a background thread after startup."""
+        try:
+            self.history = load_history()
+            self.safe_ui_call(self.refresh_history)
+        except Exception as e:
+            log_message(f"load_and_render_history failed: {e}")
+
+
     def _create_history_row(self, idx, entry):
         """Create a row for history item."""
-        row_frame = ctk.CTkFrame(self.history_scroll, height=100)
+        row_frame = ctk.CTkFrame(self.history_scroll, height=100, corner_radius=10)
         row_frame.grid_columnconfigure(1, weight=1)
 
-        thumb_label = ctk.CTkLabel(row_frame, text="No\nthumbnail", width=140, height=80, anchor="center")
+        thumb_label = ctk.CTkLabel(
+            row_frame, 
+            text="No\nthumbnail", 
+            width=140, 
+            height=80, 
+            anchor="center", 
+            corner_radius=8
+        )
         thumb_label.grid(row=0, column=0, rowspan=2, padx=(8,10), pady=8)
 
         title = entry.get("title", "<No title>")
@@ -1584,11 +1712,26 @@ class ClipsterApp:
 
         btn_frame = ctk.CTkFrame(row_frame, fg_color="transparent")
         btn_frame.grid(row=0, column=2, rowspan=2, padx=8, pady=8)
-        redl_btn = ctk.CTkButton(btn_frame, text="Re-Download", fg_color=ACCENT_COLOR, width=110,
-                                 command=lambda e=entry, i=idx: self.re_download(e, i))
+        redl_btn = ctk.CTkButton(
+            btn_frame, 
+            text="Re-Download", 
+            fg_color=ACCENT_COLOR, 
+            width=110, 
+            height=32, 
+            corner_radius=8, 
+            command=lambda e=entry, 
+            i=idx: self.re_download(e, i)
+        )
         redl_btn.pack(pady=(6,4))
-        del_btn = ctk.CTkButton(btn_frame, text="Delete", fg_color="tomato", width=110,
-                                command=lambda i=idx: (delete_history_entry(i), self.refresh_history()))
+        del_btn = ctk.CTkButton(
+            btn_frame, 
+            text="Delete", 
+            fg_color="tomato", 
+            width=110, 
+            height=32, 
+            corner_radius=8, 
+            command=lambda i=idx: (delete_history_entry(i), self.refresh_history())
+        )
         del_btn.pack(pady=(4,6))
 
         row_frame._thumb_label = thumb_label
@@ -1620,48 +1763,83 @@ class ClipsterApp:
             clear_history()
             self.refresh_history()
 
+    def _build_update_tab(self, parent):
+        import webbrowser
+        """Build the Update tab (checks GitHub for latest release)."""
+        frame = ctk.CTkFrame(parent, corner_radius=12)
+        frame.pack(fill="both", expand=True, padx=12, pady=12)
+
+        title = ctk.CTkLabel(frame, text="Check for Updates", font=ctk.CTkFont(size=18, weight="bold"))
+        title.pack(pady=(10, 4))
+
+        self.update_status_label = ctk.CTkLabel(frame, text="Checking for updates...", wraplength=480)
+        self.update_status_label.pack(pady=8)
+
+        btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        btn_frame.pack(pady=10)
+
+        self.update_check_btn = ctk.CTkButton(
+            btn_frame, text="🔄 Recheck", fg_color=ACCENT_COLOR, command=self._check_update_button
+        )
+        self.update_check_btn.pack(side="left", padx=6)
+
+        self.update_download_btn = ctk.CTkButton(
+            btn_frame, text="⬇️ Download & Install", fg_color=SECONDARY_COLOR, command=self._download_and_install_update
+        )
+        self.update_download_btn.pack(side="left", padx=6)
+
+        self.update_open_btn = ctk.CTkButton(
+            btn_frame, text="🌐 Open GitHub Page", fg_color="gray", command=lambda: webbrowser.open(GITHUB_RELEASES_URL)
+        )
+        self.update_open_btn.pack(side="left", padx=6)
+
+        # Check for updates on load
+        threading.Thread(target=self._check_for_updates, daemon=True).start()
+
+
     # ──────────────────────────────────────────────────────────────
     #  SETTINGS TAB – replace the whole block that creates the format entry
     # ──────────────────────────────────────────────────────────────
     def _build_settings_tab(self, parent):
         """Build UI for Settings tab."""
-        frame = ctk.CTkFrame(parent)
+        frame = ctk.CTkFrame(parent, corner_radius=12)
         frame.pack(fill="both", expand=True, padx=12, pady=12)
 
         # ---------- Default format ----------
-        ctk.CTkLabel(frame, text="Default format:").pack(anchor="nw", padx=8, pady=(8, 0))
-        self.settings_format_combo = ctk.CTkComboBox(
-            frame, values=ALLOWED_FORMATS, width=180
-        )
+        fmt_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        fmt_frame.pack(fill="x", padx=8, pady=(8, 4))
+        ctk.CTkLabel(fmt_frame, text="Default format:", anchor="w", width=150).pack(side="left", padx=(0, 8))
+        self.settings_format_combo = ctk.CTkComboBox(fmt_frame, values=ALLOWED_FORMATS, width=180, height=36, corner_radius=8)
         self.settings_format_combo.set(self.settings.get("default_format", "mp4"))
-        self.settings_format_combo.pack(anchor="nw", padx=8, pady=6)
+        self.settings_format_combo.pack(side="left")
 
         # ---------- Theme (real ComboBox) ----------
-        ctk.CTkLabel(frame, text="Theme:").pack(anchor="nw", padx=8, pady=(8, 0))
-        self.settings_theme_combo = ctk.CTkComboBox(
-            frame,
-            values=["dark", "light"],
-            width=120,
-            command=self._on_theme_combo_changed   # <-- NEW
-        )
+        theme_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        theme_frame.pack(fill="x", padx=8, pady=(8, 4))
+        ctk.CTkLabel(theme_frame, text="Theme:", anchor="w", width=150).pack(side="left", padx=(0, 8))
+        self.settings_theme_combo = ctk.CTkComboBox(theme_frame, values=["dark", "light"], width=120,
+                                                    height=36, corner_radius=8, command=self._on_theme_combo_changed)
         self.settings_theme_combo.set(self.settings.get("theme", "dark"))
-        self.settings_theme_combo.pack(anchor="nw", padx=8, pady=6)
+        self.settings_theme_combo.pack(side="left")
 
         
         
         # ---------- Default download folder ----------
-        ctk.CTkLabel(frame, text="Default download folder:").pack(anchor="nw", padx=8, pady=(8, 0))
-        self.default_download_path_entry = ctk.CTkEntry(frame, width=420)
+        folder_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        folder_frame.pack(fill="x", padx=8, pady=(8, 4))
+        ctk.CTkLabel(folder_frame, text="Download folder:", anchor="w", width=150).pack(side="left", padx=(0, 8))
+        self.default_download_path_entry = ctk.CTkEntry(folder_frame, width=400, height=36, corner_radius=8)
         self.default_download_path_entry.insert(0, self.settings.get("default_download_path", str(DOWNLOADS_DIR)))
-        self.default_download_path_entry.pack(anchor="nw", padx=8, pady=6)
-        ctk.CTkButton(frame, text="Choose Folder...", command=self.on_choose_download_folder).pack(anchor="nw", padx=8, pady=6)
+        self.default_download_path_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ctk.CTkButton(folder_frame, text="Browse", height=36, corner_radius=8, 
+                    command=self.on_choose_download_folder).pack(side="left")
 
         btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
         btn_frame.pack(anchor="nw", padx=8, pady=(16, 6))
 
-        ctk.CTkButton(btn_frame, text="Apply Settings", fg_color=ACCENT_COLOR, command=self.on_apply_settings).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(btn_frame, text="Reset to Defaults", fg_color="gray", command=self.on_reset_defaults).pack(side="left", padx=4)
-        ctk.CTkButton(btn_frame, text="Open Log File", fg_color=SECONDARY_COLOR, command=open_log_file).pack(side="left", padx=8)
+        ctk.CTkButton(btn_frame, text="Apply Settings", fg_color=ACCENT_COLOR, height=36, corner_radius=8, command=self.on_apply_settings).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(btn_frame, text="Reset to Defaults", fg_color="gray", height=36, corner_radius=8, command=self.on_reset_defaults).pack(side="left", padx=4)
+        ctk.CTkButton(btn_frame, text="Open Log File", fg_color=SECONDARY_COLOR, height=36, corner_radius=8, command=open_log_file).pack(side="left", padx=8)
 
     def on_apply_settings(self):
         """Apply and save settings."""
@@ -1740,25 +1918,40 @@ class ClipsterApp:
             messagebox.showerror(APP_NAME, f"Failed to save selection: {e}")
 
     def show_spinner(self, text="Please wait..."):
-        """Show spinner overlay."""
+        """Show spinner overlay with Windows 11 styling."""
         if self.spinner_overlay:
             return
         overlay = ctk.CTkToplevel(self.root)
-        overlay.geometry("320x120")
+        overlay.geometry("340x130")
         overlay.transient(self.root)
         overlay.grab_set()
         overlay.title("")
         overlay.attributes("-topmost", True)
         overlay.resizable(False, False)
-        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 160
-        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 60
+        
+        # ADD ROUNDED CORNERS HERE (before positioning)
+        try:
+            import ctypes
+            hwnd = ctypes.windll.user32.GetParent(overlay.winfo_id())
+            DWMWA_WINDOW_CORNER_PREFERENCE = 33
+            DWMWCP_ROUND = 2
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, ctypes.byref(ctypes.c_int(DWMWCP_ROUND)), ctypes.sizeof(ctypes.c_int)
+            )
+        except Exception:
+            pass
+        
+        # NOW position it
+        x = self.root.winfo_x() + (self.root.winfo_width() // 2) - 170  # Changed from 160 to 170
+        y = self.root.winfo_y() + (self.root.winfo_height() // 2) - 65  # Changed from 60 to 65
         overlay.geometry(f"+{x}+{y}")
+        
         lbl = ctk.CTkLabel(overlay, text=text, font=ctk.CTkFont(size=14))
-        lbl.pack(pady=(20, 8))
-        pb = ctk.CTkProgressBar(overlay, mode="indeterminate")
-        pb.pack(fill="x", padx=24, pady=(4, 20))
+        lbl.pack(pady=(24, 8))  # Changed padding for better spacing
+        pb = ctk.CTkProgressBar(overlay, mode="indeterminate", height=8, corner_radius=4) 
+        pb.pack(fill="x", padx=24, pady=(4, 24))  # Changed bottom padding
         pb.start()
-        self.spinner_overlay = overlay
+        self.spinner_overlay = overlay  
 
     def hide_spinner(self):
         """Hide spinner overlay."""
@@ -2130,6 +2323,7 @@ class ClipsterApp:
             messagebox.showerror(APP_NAME, f"Failed to launch preview: {e}")
 
     def _playlist_row_open_youtube(self, row):
+        import webbrowser
         """Open video on YouTube."""
         entry = getattr(row, "_entry", None)
         if not entry:
@@ -2166,86 +2360,7 @@ class ClipsterApp:
             self._rebuild_playlist_order()
             _toast(self, "Removed item from playlist view.")
 
-    def _on_row_button_press(self, event, row):
-        """Start drag operation."""
-        self._drag_source_row = row
-        row.lift()
-        if not self._drag_ghost:
-            self._drag_ghost = ctk.CTkFrame(self.playlist_scroll, height=6, fg_color=ACCENT_COLOR)
-        row._drag_start_y = event.y_root
-
-    def _on_row_motion(self, event, row):
-        """Handle drag motion with ghost indicator."""
-        if not self._drag_source_row:
-            return
-        pointer_y = event.y_root - self.playlist_scroll.winfo_rooty()
-        children = self.playlist_scroll.winfo_children()
-        target_index = None
-        for idx, child in enumerate(children):
-            cy = child.winfo_y() + child.winfo_height() // 2
-            if pointer_y < cy:
-                target_index = idx
-                break
-        if target_index is None:
-            target_index = len(children)
-        try:
-            if self._drag_ghost.winfo_ismapped():
-                self._drag_ghost.pack_forget()
-        except Exception:
-            pass
-        visual_children = [c for c in children if c is not self._drag_source_row and c is not self._drag_ghost]
-        try:
-            for c in visual_children:
-                c.pack_forget()
-            inserted = False
-            for i, c in enumerate(visual_children):
-                if i == target_index and not inserted:
-                    self._drag_ghost.pack(fill="x", padx=6, pady=2)
-                    inserted = True
-                c.pack(fill="x", padx=6, pady=4)
-            if not inserted:
-                self._drag_ghost.pack(fill="x", padx=6, pady=2)
-        except Exception:
-            pass
-
-    def _on_row_release(self, event, row):
-        """Finish drag and reorder rows."""
-        if not self._drag_source_row:
-            return
-        try:
-            if self._drag_ghost and self._drag_ghost.winfo_ismapped():
-                children = [c for c in self.playlist_scroll.winfo_children() if c is not self._drag_ghost]
-                for c in children:
-                    c.pack_forget()
-                inserted = False
-                for c in children:
-                    if not inserted:
-                        if c.winfo_y() > self._drag_source_row.winfo_y():
-                            self._drag_source_row.pack_forget()
-                            self._drag_source_row.pack(fill="x", padx=6, pady=4)
-                            inserted = True
-                    c.pack(fill="x", padx=6, pady=4)
-                if not inserted:
-                    self._drag_source_row.pack_forget()
-                    self._drag_source_row.pack(fill="x", padx=6, pady=4)
-            if self._drag_ghost:
-                try:
-                    self._drag_ghost.pack_forget()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        finally:
-            self._drag_source_row = None
-            self._rebuild_playlist_order()
-
-    def _rebuild_playlist_order(self):
-        """Rebuild playlist row order based on current UI."""
-        order = []
-        for child in self.playlist_scroll.winfo_children():
-            if getattr(child, "_video_id", None):
-                order.append(child._video_id)
-        self._playlist_row_order = order
+    
 
     def re_download(self, entry, index_in_history=None):
         """Re-download a history entry."""
@@ -2546,13 +2661,7 @@ class ClipsterApp:
             for child in row.winfo_children():
                 child.bind("<Button-3>", on_right_click)
 
-            row.bind("<Button-1>", lambda ev, r=row: self._on_row_button_press(ev, r))
-            row.bind("<B1-Motion>", lambda ev, r=row: self._on_row_motion(ev, r))
-            row.bind("<ButtonRelease-1>", lambda ev, r=row: self._on_row_release(ev, r))
-            for child in row.winfo_children():
-                child.bind("<Button-1>", lambda ev, r=row: self._on_row_button_press(ev, r))
-                child.bind("<B1-Motion>", lambda ev, r=row: self._on_row_motion(ev, r))
-                child.bind("<ButtonRelease-1>", lambda ev, r=row: self._on_row_release(ev, r))
+
 
             try:
                 self.playlist_progress_label.configure(text=f"Loaded {idx} items...")
@@ -2693,11 +2802,13 @@ if __name__ == "__main__":
         root = ctk.CTk()
         app = ClipsterApp(root)
 
-        # Check for updates shortly after launch
-        root.after(2000, check_latest_version)
+        # Schedule deferred tasks
+        root.after(100, lambda: threading.Thread(target=app.load_and_render_history, daemon=True).start())
+        root.after(2000, lambda: threading.Thread(target=app._check_for_updates, daemon=True).start())
 
         root.protocol("WM_DELETE_WINDOW", app._close_window)
         root.mainloop()
+
 
     except Exception as e:
         import traceback
