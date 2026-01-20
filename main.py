@@ -3,33 +3,24 @@ import sys
 import re
 import json
 import time
-
 import queue
 import threading
+import tempfile
+import atexit
 import subprocess
-
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse, parse_qs
-
-import tempfile
-import errno
-import functools
-
-from time import monotonic
-
-
 
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
 
-from PIL import Image
+_HISTORY_RW_LOCK = threading.RLock()
 
 # --------------------------------------------
 # Branding / Config
 # --------------------------------------------
 APP_NAME = "Clipster"
-APP_VERSION = "1.2.4"
+APP_VERSION = "1.2.5"
 ACCENT_COLOR = "#0078D7"
 SECONDARY_COLOR = "#00B7C2"
 SPLASH_TEXT = "Fetch. Download. Enjoy."
@@ -62,7 +53,14 @@ LOG_FILE = BASE_DIR / "clipster.log"
 
 # --------------------------------------------
 # Update check (GitHub latest release)
-# --------------------------------------------
+# --------------------------------------------\
+
+def get_pil_image():
+    global Image
+    if 'Image' not in globals():
+        from PIL import Image as PILImage
+        Image = PILImage
+    return Image
 
 
 def run_subprocess_safe(cmd, timeout=300, cwd=None, capture_output=True):
@@ -190,15 +188,13 @@ DEFAULT_SETTINGS = {
 def load_settings():
     """Load settings from JSON file, falling back to defaults."""
     if not SETTINGS_FILE.exists():
-        save_settings(DEFAULT_SETTINGS)
+        # Don't save immediately - defer to first actual change
         return DEFAULT_SETTINGS.copy()
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        for k, v in DEFAULT_SETTINGS.items():
-            if k not in data:
-                data[k] = v
-        return data
+        # Merge with defaults efficiently
+        return {**DEFAULT_SETTINGS, **data}
     except Exception:
         return DEFAULT_SETTINGS.copy()
 
@@ -212,28 +208,33 @@ def save_settings(settings):
 
 
 def load_history():
-    data = safe_read_json(HISTORY_FILE, default=[])
-    if data is None:
-        return []
-    return data
+    # Fix: Acquire lock even for reading to ensure we don't read partial writes
+    with _HISTORY_RW_LOCK:
+        data = safe_read_json(HISTORY_FILE, default=[])
+        if data is None:
+            return []
+        return data
 
 
 def append_history(entry):
-    history = load_history() or []
-    history.insert(0, entry)
-    safe_write_json(HISTORY_FILE, history)
+    # Fix: Atomic read-modify-write cycle
+    with _HISTORY_RW_LOCK:
+        history = load_history() or []
+        history.insert(0, entry)
+        safe_write_json(HISTORY_FILE, history)
 
 
 def delete_history_entry(index):
-    """Delete a specific entry from history (atomic)."""
-    history = load_history()
-    if 0 <= index < len(history):
-        history.pop(index)
-        safe_write_json(HISTORY_FILE, history)
+    # Fix: Atomic read-modify-write cycle
+    with _HISTORY_RW_LOCK:
+        history = load_history()
+        if history and 0 <= index < len(history):
+            history.pop(index)
+            safe_write_json(HISTORY_FILE, history)
 
 def clear_history():
-    """Clear all history entries safely."""
-    safe_write_json(HISTORY_FILE, [])
+    with _HISTORY_RW_LOCK:
+        safe_write_json(HISTORY_FILE, [])
 
 # --------------------------------------------
 # Utility
@@ -264,6 +265,9 @@ def _acquire_file_lock(lock_path, timeout=_FILE_LOCK_TIMEOUT):
     Return a file descriptor which should be closed/unlinked by caller.
     If can't acquire within timeout, raise TimeoutError.
     """
+
+    import monotonic, errno
+
     start = monotonic()
     while True:
         try:
@@ -410,14 +414,20 @@ def show_toast(root, message, title=None, timeout=3000, level="info", theme="dar
 
 # convenience wrapper that checks settings
 def _toast(app, message, title=None, timeout=3000, level="info"):
+    """Thread-safe wrapper for showing toasts."""
     if not getattr(app, "settings", None):
         return
     if not app.settings.get("show_toasts", True):
         return
-    try:
-        show_toast(app.root, message, title=title, timeout=timeout, level=level, theme=app.settings.get("theme","dark"))
-    except Exception:
-        pass
+    
+    # Fix: Ensure UI creation happens on the main thread
+    if threading.current_thread() is threading.main_thread():
+        try:
+            show_toast(app.root, message, title=title, timeout=timeout, level=level, theme=app.settings.get("theme","dark"))
+        except Exception:
+            pass
+    else:
+        app.root.after(0, lambda: _toast(app, message, title, timeout, level))
 # ---------------------------------------------------------------------------------------
 
 
@@ -602,6 +612,9 @@ def get_best_thumbnail_url(meta_or_url_or_vid):
     Given meta dict, full url, or vid id - return a likely thumbnail URL.
     Tries meta['thumbnail'] first, then YouTube standard endpoints.
     """
+
+    from urllib.parse import urlparse, parse_qs
+
     try:
         if isinstance(meta_or_url_or_vid, dict):
             t = meta_or_url_or_vid.get("thumbnail")
@@ -646,6 +659,8 @@ def get_best_thumbnail_url(meta_or_url_or_vid):
 
 def embed_thumbnail_with_ffmpeg(video_path, thumb_path):
     """Embed thumbnail into video using ffmpeg in a safe atomic way."""
+
+
     if not FFMPEG_EXE.exists():
         return False
     video_path = Path(video_path)
@@ -781,7 +796,8 @@ class ClipsterApp:
 
 
         self.settings = load_settings()
-        self.history = []  # Defer history loading
+        self.history = []
+        self._history_loaded = False
 
         ctk.set_appearance_mode(self.settings.get("theme", "dark"))
 
@@ -957,18 +973,35 @@ class ClipsterApp:
         left.pack(side="left", padx=(8, 4), pady=2)
 
         icon_img = None
-        png_path = BASE_DIR / "Assets" / "clipster.png"
         ico_path = BASE_DIR / "Assets" / "clipster.ico"
 
+        # Set icon immediately without PIL
         try:
-            if png_path.exists():
-                img = Image.open(png_path).convert("RGBA")
-                img.thumbnail((20, 20))
-                icon_img = ctk.CTkImage(img, size=(20, 20))
             if ico_path.exists():
                 self.root.iconbitmap(default=str(ico_path))
         except Exception:
             pass
+
+        # Defer PNG thumbnail creation
+        def load_titlebar_icon():
+            try:
+                png_path = BASE_DIR / "Assets" / "clipster.png"
+                if png_path.exists():
+                    Image = get_pil_image()
+                    img = Image.open(png_path).convert("RGBA")
+                    img.thumbnail((20, 20))
+                    icon_img = ctk.CTkImage(img, size=(20, 20))
+                    icon_lbl.configure(image=icon_img)
+                    icon_lbl.image = icon_img
+            except Exception:
+                pass
+
+        # Create placeholder first
+        icon_lbl = ctk.CTkLabel(left, text="▶", font=ctk.CTkFont(size=13))
+        icon_lbl.pack(side="left", pady=1)
+
+        # Load actual icon after 200ms
+        self.root.after(200, load_titlebar_icon)
 
         if icon_img:
             icon_lbl = ctk.CTkLabel(left, image=icon_img, text="")
@@ -1083,6 +1116,8 @@ class ClipsterApp:
 
     def graceful_shutdown(self, timeout=5):
         """Cancel active downloads, stop workers, clean temp files."""
+        import monotonic
+
         try:
             self.current_task_cancelled = True
             try:
@@ -1139,6 +1174,7 @@ class ClipsterApp:
     def _safe_create_ctkimage(self, img_path, size):
         """Safely create CTkImage from path."""
         try:
+            Image = get_pil_image()
             img = Image.open(img_path).convert("RGBA")
             img.thumbnail(size)
             ctkimg = ctk.CTkImage(img, size=size)
@@ -1687,8 +1723,12 @@ class ClipsterApp:
 
     def load_and_render_history(self):
         """Load history in a background thread after startup."""
+        if self._history_loaded:
+            return
         try:
+            time.sleep(0.1)  # Small delay to let UI settle
             self.history = load_history()
+            self._history_loaded = True
             self.safe_ui_call(self.refresh_history)
         except Exception as e:
             log_message(f"load_and_render_history failed: {e}")
@@ -1751,6 +1791,8 @@ class ClipsterApp:
 
     def _extract_video_id(self, url):
         """Extract video ID from YouTube URL."""
+        from urllib.parse import urlparse, parse_qs
+
         try:
             u = (url or "").strip()
             parsed = urlparse(u)
@@ -2201,6 +2243,7 @@ class ClipsterApp:
 
 
     def on_download_playlist(self):
+        import shutil
         """Download selected playlist items in order."""
         selected_entries = []
         for vid in list(self._playlist_row_order):
