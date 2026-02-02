@@ -9,7 +9,6 @@ import tempfile
 import atexit
 import subprocess
 from datetime import datetime
-from win10toast_click import ToastNotifier
 from pathlib import Path
 
 import customtkinter as ctk
@@ -33,6 +32,7 @@ GITHUB_RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
 
 BASE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = BASE_DIR / "Assets"
+APP_ICON_PATH = ASSETS_DIR / "app_icon.ico"
 WINDOWS_DOWNLOADS_DIR = str(Path.home() / "Downloads")
 DOWNLOADS_DIR = BASE_DIR / "downloads"
 TEMP_DIR = BASE_DIR / "temp"
@@ -791,26 +791,11 @@ class ClipsterApp:
         if getattr(self, "_executor", None):
             self.get_executor().submit(func, *args)
 
-    def notify(self, title, message, duration=5):
-        """Send native Windows notification."""
-        try:
-            self.win_notifier.show_toast(
-                title=title,
-                msg=message,
-                duration=duration,
-                threaded=True,
-                icon_path=str(APP_ICON_PATH) if APP_ICON_PATH.exists() else None
-            )
-        except Exception as e:
-            log_message(f"Windows notification failed: {e}")
-
 
     """Main application class for Clipster GUI."""
     def __init__(self, root):
         import concurrent.futures
         self.root = root
-
-        self.win_notifier = ToastNotifier()
 
         # enable toasts on root
         try:
@@ -1665,27 +1650,26 @@ class ClipsterApp:
             command=self.on_download_playlist
         ).pack(side="right", padx=6)
 
-       # --- Overall Progress (always visible) ---
-        self.playlist_progress_container = ctk.CTkFrame(frame, fg_color="transparent")
-
-        self.playlist_progress_container.pack(fill="x", padx=6, pady=(6, 8))
+        # --- Overall progress placed BELOW everything ---
+        progress_container = ctk.CTkFrame(parent, fg_color="transparent")
+        progress_container.pack(fill="x", pady=(6, 8), side="bottom")
 
         ctk.CTkLabel(
-            self.playlist_progress_container,
+            progress_container,
             text="Overall Progress:",
             text_color="#A0A0A0",
             anchor="w"
-        ).pack(anchor="w", padx=2, pady=(0, 2))
+        ).pack(anchor="w", padx=6, pady=(4, 0))
 
         self.playlist_overall_progress = ctk.CTkProgressBar(
-            self.playlist_progress_container,
+            progress_container,
             height=10,
             fg_color="#2E2E2E",
             progress_color=ACCENT_COLOR,
             corner_radius=8
         )
         self.playlist_overall_progress.set(0)
-        self.playlist_overall_progress.pack(fill="x")
+        self.playlist_overall_progress.pack(fill="x", padx=6, pady=(0, 8))
 
 
     def _build_history_tab(self, parent):
@@ -1712,8 +1696,6 @@ class ClipsterApp:
 
     def refresh_history(self):
         """Refresh history list UI."""
-        if not hasattr(self, "history_scroll"):
-            return
         for widget in self.history_scroll.winfo_children():
             widget.destroy()
         self._history_thumb_imgs.clear()
@@ -2119,12 +2101,7 @@ class ClipsterApp:
         filename_template = "%(title)s.%(ext)s"
         self.single_download_btn.configure(state="disabled")
         # cancel button removed; notify user with a toast instead
-        #_toast(self, "Download started...", title="Download", timeout=3000)
-        self.notify(
-            "Clipster Download Started",
-            Path(output_path).name
-        )
-
+        _toast(self, "Download started...", title="Download", timeout=3000)
         self.single_progress.set(0)
         self.single_progress_label.configure(text="Starting...")
         self.current_task_cancelled = False
@@ -2644,7 +2621,7 @@ class ClipsterApp:
                 else:
                     self.thumbnail_label.configure(text="No thumbnail available")
 
-            self.notify("Clipster", "Video metadata fetched successfully")
+            _toast(self, "Metadata fetched.", title="Fetch complete")
             return
 
 
@@ -2656,9 +2633,7 @@ class ClipsterApp:
                 messagebox.showerror(APP_NAME, "This video is age-restricted or members-only and requires sign-in. Clipster cannot download it.\n\nTip: use yt-dlp with a cookies file (manual).")
             else:
                 messagebox.showerror(APP_NAME, f"Failed to fetch metadata: {err}")
-        
-            self.notify("Clipster", "Ready")
- 
+            _toast(self, "Ready")
             return
 
         if ev == "single_progress":
@@ -2863,8 +2838,6 @@ class ClipsterApp:
             return
 
         if ev == "history_thumb_ready":
-            if not hasattr(self, "history_scroll"):
-                return
             idx = item[1]
             thumb_path = item[2]
             for child in self.history_scroll.winfo_children():
