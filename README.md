@@ -1,35 +1,20 @@
-# 🎬 Clipster
+# Clipster v1.2.6
 
-**Clipster v1.2.5** — the *Stability & Update Enhancement Release*.
-A fast, modern YouTube downloader for Windows — powered by **yt-dlp**, **FFmpeg**, and a polished **CustomTkinter** GUI with Windows 11 styling.
+A modern, high-performance GUI video downloader powered by Python and `yt-dlp`.
+
+## 🚀 What's New in v1.2.6
+This release focuses on **engine reliability** and **app stability**:
+
+* **Updated Downloader Engine:** Bundled with the latest `yt-dlp` to ensure compatibility with recent platform changes.
+* **Thread-Safe History:** Implemented a new locking system to ensure your download history saves correctly without crashes.
+* **Improved Process Handling:** Better management of background tasks—canceling a download now instantly frees up system resources.
+* **Bug Fixes:** Resolved internal errors that occurred during the initial app load.
+
 
 > **Fetch. Download. Enjoy.**
 
 ---
 
-## ✨ What’s New in v1.2.5
-
-### 🚀 Core Improvements
-
-* 🔄 **Updated yt-dlp to v2025.12.08** for improved compatibility with newer YouTube formats
-* 🎬 **Updated FFmpeg to v2026-01-14** for better remuxing, merging, and media handling
-* 🧩 Improved background task handling for batch & playlist downloads
-* 🧾 More resilient metadata fetching and restricted-content detection
-
-### 🎨 UI & UX Enhancements
-
-* ✨ Smoother interactions across Single, Batch, and Playlist modes
-* 🖼️ More reliable thumbnail loading and caching
-* 🔔 Polished toast notifications and progress feedback
-* 🌙 Better theme consistency across titlebar, Mica, and dialogs
-
-### 🛠 Stability & Maintenance
-
-* 🧹 Internal cleanup and refactoring for long-running sessions
-* 🧠 Safer process lifecycle management (downloads, updates, shutdown)
-* 🔄 Improved GitHub update check & install flow
-
----
 
 ## ⚙️ Installation
 

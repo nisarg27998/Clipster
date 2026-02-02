@@ -4,6 +4,23 @@ All notable changes to **Clipster** are documented here.
 
 ---
 
+# Changelog
+
+## [1.2.6] - 2026-02-02
+### Added
+- Implementation of global locks for thread-safe history read/write operations to prevent data corruption.
+- Added graceful cleanup logic for temporary files and memory during application shutdown.
+
+### Fixed
+- **Core:** Updated `yt-dlp` to the latest version to resolve download throttling and extraction errors.
+- **Stability:** Fixed `AttributeError` related to history loading state.
+- **Process Management:** Refactored `DownloadProcess` to properly handle task cancellation and eliminate "zombie" background processes.
+
+### Changed
+- Improved history rendering logic with better state management.
+
+---
+
 ## 📦 v1.2.4 — *Polish & Precision Update* (November 2025)
 
 ### ⚡ Performance & Stability

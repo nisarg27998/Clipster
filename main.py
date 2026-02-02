@@ -9,6 +9,7 @@ import tempfile
 import atexit
 import subprocess
 from datetime import datetime
+from win10toast_click import ToastNotifier
 from pathlib import Path
 
 import customtkinter as ctk
@@ -20,7 +21,7 @@ _HISTORY_RW_LOCK = threading.RLock()
 # Branding / Config
 # --------------------------------------------
 APP_NAME = "Clipster"
-APP_VERSION = "1.2.5"
+APP_VERSION = "1.2.6"
 ACCENT_COLOR = "#0078D7"
 SECONDARY_COLOR = "#00B7C2"
 SPLASH_TEXT = "Fetch. Download. Enjoy."
@@ -32,6 +33,7 @@ GITHUB_RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
 
 BASE_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = BASE_DIR / "Assets"
+WINDOWS_DOWNLOADS_DIR = str(Path.home() / "Downloads")
 DOWNLOADS_DIR = BASE_DIR / "downloads"
 TEMP_DIR = BASE_DIR / "temp"
 HISTORY_FILE = BASE_DIR / "history.json"
@@ -100,6 +102,12 @@ def run_subprocess_safe(cmd, timeout=300, cwd=None, capture_output=True):
 
 _SAFE_FILENAME_RE = re.compile(r'[^A-Za-z0-9 ._\-()]')
 
+
+def get_executor(self):
+    if self._executor is None:
+        import concurrent.futures
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=6)
+    return self._executor
 
 
 
@@ -177,7 +185,7 @@ DEFAULT_SETTINGS = {
     "theme": "dark",
 
     # default to user's Windows Downloads folder (cross-platform fallback)
-    "default_download_path": str(Path.home() / "Downloads"),
+    "default_download_path": WINDOWS_DOWNLOADS_DIR,
     "cookies_path": "",
     "show_toasts": True,
     "thumbnail_after_fetch": True
@@ -266,9 +274,9 @@ def _acquire_file_lock(lock_path, timeout=_FILE_LOCK_TIMEOUT):
     If can't acquire within timeout, raise TimeoutError.
     """
 
-    import monotonic, errno
+    import errno
 
-    start = monotonic()
+    start = time.monotonic()
     while True:
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -281,7 +289,7 @@ def _acquire_file_lock(lock_path, timeout=_FILE_LOCK_TIMEOUT):
         except OSError as e:
             if e.errno != errno.EEXIST:
                 raise
-            if monotonic() - start > timeout:
+            if time.monotonic() - start > timeout:
                 raise TimeoutError(f"Could not acquire lock {lock_path}")
             time.sleep(0.05)
 
@@ -294,6 +302,9 @@ def _release_file_lock(fd, lock_path):
         os.unlink(lock_path)
     except Exception:
         pass
+
+
+
 
 def safe_write_json(path: Path, data, *, lock_suffix=".lock"):
     """Write JSON atomically using tempfile + os.replace with optional lock."""
@@ -485,8 +496,17 @@ class DownloadProcess:
         
 
     def shutdown(self):
-        
-        pass
+        with self._lock:
+            if self.proc and self.proc.poll() is None:
+                try:
+                    self.proc.terminate()
+                    time.sleep(0.2)
+                    if self.proc.poll() is None:
+                        self.proc.kill()
+                except Exception:
+                    pass
+            self.proc = None
+
 
     def start_download(self, url, outdir, filename_template, format_selector, cookies_path=None, progress_callback=None, finished_callback=None, error_callback=None):
         """Start a download thread."""
@@ -769,13 +789,28 @@ class ClipsterApp:
 
     def run_bg(self, func, *args):
         if getattr(self, "_executor", None):
-            self._executor.submit(func, *args)
+            self.get_executor().submit(func, *args)
+
+    def notify(self, title, message, duration=5):
+        """Send native Windows notification."""
+        try:
+            self.win_notifier.show_toast(
+                title=title,
+                msg=message,
+                duration=duration,
+                threaded=True,
+                icon_path=str(APP_ICON_PATH) if APP_ICON_PATH.exists() else None
+            )
+        except Exception as e:
+            log_message(f"Windows notification failed: {e}")
 
 
     """Main application class for Clipster GUI."""
     def __init__(self, root):
         import concurrent.futures
         self.root = root
+
+        self.win_notifier = ToastNotifier()
 
         # enable toasts on root
         try:
@@ -788,7 +823,7 @@ class ClipsterApp:
         self.root.minsize(900, 600)
 
         # Hide window initially to prevent flashing during setup
-        self.root.withdraw()
+        #self.root.withdraw()
 
         ensure_directories()
         # Defer executable checks to after UI is shown to speed up initial render
@@ -802,7 +837,7 @@ class ClipsterApp:
         ctk.set_appearance_mode(self.settings.get("theme", "dark"))
 
         self.download_proc = DownloadProcess()
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=6)
+        self._executor = None
         self.ui_queue = queue.Queue()
         self.current_task_cancelled = False
 
@@ -814,12 +849,30 @@ class ClipsterApp:
 
 
 
-        self._build_ui()
-        self._enable_mica_effect()
+        self._build_skeleton_ui()
+        self.root.after(50, self._build_ui)
+        self.root.after(150, self._enable_mica_effect)
         self.root.after(100, self._process_ui_queue)
 
         # Show window after setup to avoid flashing
-        self.root.after(100, self._show_window_after_setup)
+        self.root.after(0, self._show_window_after_setup)
+
+    def _build_skeleton_ui(self):
+        """Build minimal UI shell for fast startup."""
+        self._create_titlebar()
+        self.tabs = ctk.CTkTabview(self.root, width=980, height=540, corner_radius=12)
+        self.tabs.pack(padx=12, pady=6, fill="both", expand=True)
+
+        for name in (
+            "Single Video",
+            "Batch Downloader",
+            "Playlist Downloader",
+            "History",
+            "Settings",
+            "Update",
+        ):
+            self.tabs.add(name)
+
 
     def _check_for_updates(self):
         """Check GitHub API for newer releases."""
@@ -1114,45 +1167,46 @@ class ClipsterApp:
         except Exception:
             pass
 
-    def graceful_shutdown(self, timeout=5):
-        """Cancel active downloads, stop workers, clean temp files."""
-        import monotonic
-
+    def graceful_shutdown(self):
+        """Safely shut down downloads, background workers, and temp files."""
         try:
             self.current_task_cancelled = True
+
+            # Cancel active yt-dlp process
             try:
-                self.download_proc.cancel()
-                try:
+                if self.download_proc:
+                    self.download_proc.cancel()
                     self.download_proc.shutdown()
-                except Exception:
-                    pass
             except Exception:
                 pass
-            # shut down executor
-            if getattr(self, "_executor", None):
+
+            # Shut down executor safely
+            executor = getattr(self, "_executor", None)
+            if executor:
                 try:
-                    self._executor.shutdown(wait=False)
+                    executor.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    # Python < 3.9 fallback
+                    executor.shutdown(wait=False)
                 except Exception:
                     pass
-                self._executor = None
-                # wait a short time
-                start = monotonic()
-                while monotonic() - start < timeout:
-                    if self._executor._work_queue.empty():
-                        break
-                    time.sleep(0.05)
+                finally:
+                    self._executor = None
+
         except Exception as e:
-            log_message(f"graceful_shutdown: {e}")
-        # optional: remove temp files older than X
+            log_message(f"graceful_shutdown error: {e}")
+
+        # Cleanup old temp files (best-effort)
         try:
             for p in TEMP_DIR.iterdir():
                 try:
-                    if p.is_file() and (time.time() - p.stat().st_mtime) > 60*60*24:  # older than 24h
+                    if p.is_file() and (time.time() - p.stat().st_mtime) > 24 * 60 * 60:
                         p.unlink(missing_ok=True)
                 except Exception:
                     pass
         except Exception:
             pass
+
 
 
     def _animate_window(self, action="show"):
@@ -1217,7 +1271,8 @@ class ClipsterApp:
             self.root.configure(fg_color=ctk.ThemeManager.theme["CTkFrame"]["fg_color"])
         except Exception:
             pass
-        self.refresh_history()
+        if not self._history_loaded:
+            self.root.after(300, self.load_and_render_history)
         self._update_titlebar_theme()
         self._enable_mica_effect()
         self.root.update_idletasks()
@@ -1381,33 +1436,21 @@ class ClipsterApp:
         menu_win.focus_force()
 
     def _build_ui(self):
-        """Build the main UI components."""
+        """Populate tab contents (called after skeleton UI is visible)."""
         try:
-            self._create_titlebar()
+            self._build_single_tab(self.tabs.tab("Single Video"))
+            self._build_batch_tab(self.tabs.tab("Batch Downloader"))
+            self._build_playlist_tab(self.tabs.tab("Playlist Downloader"))
+            self._build_history_tab(self.tabs.tab("History"))
+            self._build_settings_tab(self.tabs.tab("Settings"))
+            self._build_update_tab(self.tabs.tab("Update"))
+
+            self.status_var = None
+            self.cancel_btn = None
+            self.spinner_overlay = None
+
         except Exception as e:
-            log_message(f"_create_titlebar failed: {e}")
-
-        self.tabs = ctk.CTkTabview(self.root, width=980, height=540, corner_radius=12)
-        self.tabs.pack(padx=12, pady=6, fill="both", expand=True)
-        self.tabs.add("Single Video")
-        self.tabs.add("Batch Downloader")
-        self.tabs.add("Playlist Downloader")
-        self.tabs.add("History")
-        self.tabs.add("Settings")
-        self.tabs.add("Update")
-        self._build_update_tab(self.tabs.tab("Update"))
-
-
-        self._build_single_tab(self.tabs.tab("Single Video"))
-        self._build_batch_tab(self.tabs.tab("Batch Downloader"))
-        self._build_playlist_tab(self.tabs.tab("Playlist Downloader"))
-        self._build_history_tab(self.tabs.tab("History"))
-        self._build_settings_tab(self.tabs.tab("Settings"))
-
-        self.status_var = None
-        self.cancel_btn = None
-
-        self.spinner_overlay = None
+            log_message(f"_build_ui error: {e}")
 
     def _build_single_tab(self, parent):
         """Build UI for Single Video tab."""
@@ -1622,26 +1665,27 @@ class ClipsterApp:
             command=self.on_download_playlist
         ).pack(side="right", padx=6)
 
-        # --- Overall progress placed BELOW everything ---
-        progress_container = ctk.CTkFrame(parent, fg_color="transparent")
-        progress_container.pack(fill="x", pady=(6, 8), side="bottom")
+       # --- Overall Progress (always visible) ---
+        self.playlist_progress_container = ctk.CTkFrame(frame, fg_color="transparent")
+
+        self.playlist_progress_container.pack(fill="x", padx=6, pady=(6, 8))
 
         ctk.CTkLabel(
-            progress_container,
+            self.playlist_progress_container,
             text="Overall Progress:",
             text_color="#A0A0A0",
             anchor="w"
-        ).pack(anchor="w", padx=6, pady=(4, 0))
+        ).pack(anchor="w", padx=2, pady=(0, 2))
 
         self.playlist_overall_progress = ctk.CTkProgressBar(
-            progress_container,
+            self.playlist_progress_container,
             height=10,
             fg_color="#2E2E2E",
             progress_color=ACCENT_COLOR,
             corner_radius=8
         )
         self.playlist_overall_progress.set(0)
-        self.playlist_overall_progress.pack(fill="x", padx=6, pady=(0, 8))
+        self.playlist_overall_progress.pack(fill="x")
 
 
     def _build_history_tab(self, parent):
@@ -1658,15 +1702,18 @@ class ClipsterApp:
             fg_color="tomato", 
             height=36, 
             corner_radius=8
-        )
+        ).pack(side="right", padx=8, pady=6)
 
         self.history_scroll = ctk.CTkScrollableFrame(frame, height=480, corner_radius=10)
         self.history_scroll.pack(fill="both", expand=True, padx=6, pady=6)
 
-        self.refresh_history()
+        if not self._history_loaded:
+            self.root.after(300, self.load_and_render_history)
 
     def refresh_history(self):
         """Refresh history list UI."""
+        if not hasattr(self, "history_scroll"):
+            return
         for widget in self.history_scroll.winfo_children():
             widget.destroy()
         self._history_thumb_imgs.clear()
@@ -1717,7 +1764,7 @@ class ClipsterApp:
 
             #threading.Thread(target=thumb_task, args=(idx, entry), daemon=True).start()
             if getattr(self, "_executor", None):
-                self._executor.submit(thumb_task, idx, entry)
+                self.get_executor().submit(thumb_task, idx, entry)
             else:
                 threading.Thread(target=thumb_task, args=(idx, entry), daemon=True).start()
 
@@ -1845,7 +1892,7 @@ class ClipsterApp:
         self.update_open_btn.pack(side="left", padx=6)
 
         # Check for updates on load
-        threading.Thread(target=self._check_for_updates, daemon=True).start()
+        #threading.Thread(target=self._check_for_updates, daemon=True).start()
 
 
     # ──────────────────────────────────────────────────────────────
@@ -1911,7 +1958,7 @@ class ClipsterApp:
             self.settings_format_combo.set("mp4")
             self.settings_theme_combo.set("dark")
             self.default_download_path_entry.delete(0, "end")
-            self.default_download_path_entry.insert(0, str(DOWNLOADS_DIR))
+            self.default_download_path_entry.insert(0, WINDOWS_DOWNLOADS_DIR)
             log_message("Settings reset to defaults")
             self._apply_theme()
             _toast(self, "Settings reset to defaults.", title="Settings")
@@ -1919,7 +1966,7 @@ class ClipsterApp:
 
     def on_choose_download_folder(self):
         """Choose default download folder."""
-        path = filedialog.askdirectory(initialdir=self.settings.get("default_download_path", str(DOWNLOADS_DIR)))
+        path = filedialog.askdirectory(initialdir=self.settings.get("default_download_path", WINDOWS_DOWNLOADS_DIR))
         if path:
             self.default_download_path_entry.delete(0, "end")
             self.default_download_path_entry.insert(0, path)
@@ -2050,7 +2097,7 @@ class ClipsterApp:
             except Exception as e:
                 self.ui_queue.put(("meta_error", str(e)))
         if getattr(self, "_executor", None):
-            self._executor.submit(task)
+            self.get_executor().submit(task)
         else:
             threading.Thread(target=task, daemon=True).start()
 
@@ -2064,7 +2111,7 @@ class ClipsterApp:
         fmt = self.single_format_combo.get()
         embed_thumb = False
         res_label = self.single_resolution_combo.get()
-        outdir = self.settings.get("default_download_path", str(DOWNLOADS_DIR))
+        outdir = self.settings.get("default_download_path", WINDOWS_DOWNLOADS_DIR)
         total, used, free = shutil.disk_usage(outdir)
         if free < 500 * 1024 * 1024:
             messagebox.showwarning(APP_NAME, "Low disk space detected! You may run out during download.")
@@ -2072,7 +2119,12 @@ class ClipsterApp:
         filename_template = "%(title)s.%(ext)s"
         self.single_download_btn.configure(state="disabled")
         # cancel button removed; notify user with a toast instead
-        _toast(self, "Download started...", title="Download", timeout=3000)
+        #_toast(self, "Download started...", title="Download", timeout=3000)
+        self.notify(
+            "Clipster Download Started",
+            Path(output_path).name
+        )
+
         self.single_progress.set(0)
         self.single_progress_label.configure(text="Starting...")
         self.current_task_cancelled = False
@@ -2112,7 +2164,7 @@ class ClipsterApp:
         target_format = self.batch_format_combo.get()
         max_res = self.batch_maxres_combo.get()
         embed_thumb = False  # embed removed permanently
-        outdir = self.settings.get("default_download_path", str(DOWNLOADS_DIR))
+        outdir = self.settings.get("default_download_path", WINDOWS_DOWNLOADS_DIR)
 
         total, used, free = shutil.disk_usage(outdir)
         if free < 500 * 1024 * 1024:
@@ -2236,7 +2288,7 @@ class ClipsterApp:
 
 
         if getattr(self, "_executor", None):
-            self._executor.submit(task)
+            self.get_executor().submit(task)
         else:
             threading.Thread(target=task, daemon=True).start()
 
@@ -2266,7 +2318,7 @@ class ClipsterApp:
         target_format = self.playlist_format_combo.get()
         max_res = self.playlist_maxres_combo.get()
         embed_thumb = False
-        outdir = self.settings.get("default_download_path", str(DOWNLOADS_DIR))
+        outdir = self.settings.get("default_download_path", WINDOWS_DOWNLOADS_DIR)
         total, used, free = shutil.disk_usage(outdir)
         if free < 500 * 1024 * 1024:
             messagebox.showwarning(APP_NAME, "Low disk space detected! You may run out during download.")
@@ -2421,7 +2473,7 @@ class ClipsterApp:
         url = entry.get("url")
         fmt = entry.get("format", self.settings.get("default_format", "mp4"))
         res = entry.get("resolution", "Best Available")
-        outdir = entry.get("download_path", self.settings.get("default_download_path", str(DOWNLOADS_DIR)))
+        outdir = entry.get("download_path", self.settings.get("default_download_path", WINDOWS_DOWNLOADS_DIR))
         embed = self.settings.get("embed_thumbnail", True)
         fmt_selector = build_format_selector_for_format_and_res(fmt, res)
 
@@ -2456,6 +2508,42 @@ class ClipsterApp:
                 _wrapped()
         except Exception:
             pass
+
+    def _reset_single_video_ui(self):
+        """Reset Single Video tab UI for next download."""
+        try:
+            # Clear URL
+            self.single_url_entry.delete(0, "end")
+
+            # Clear metadata
+            self.meta_title_var.set("")
+            self.meta_uploader_var.set("")
+            self.meta_duration_var.set("")
+
+            # Reset resolution & format
+            self.single_resolution_combo.configure(values=["Best Available"])
+            self.single_resolution_combo.set("Best Available")
+
+            # Reset thumbnail
+            self.thumbnail_label.configure(text="Thumbnail preview", image=None)
+            self.thumbnail_label.image = None
+            if hasattr(self.thumbnail_label, "image_path"):
+                del self.thumbnail_label.image_path
+
+            # Disable Save Thumbnail button
+            self.save_thumb_btn.configure(state="disabled", fg_color="gray")
+
+            # Clear cached metadata
+            if hasattr(self, "_last_meta"):
+                del self._last_meta
+
+            # Reset progress
+            self.single_progress.set(0)
+            self.single_progress_label.configure(text="")
+
+        except Exception as e:
+            log_message(f"_reset_single_video_ui error: {e}")
+
 
 
     def cancel_download(self):
@@ -2556,7 +2644,7 @@ class ClipsterApp:
                 else:
                     self.thumbnail_label.configure(text="No thumbnail available")
 
-            _toast(self, "Metadata fetched.", title="Fetch complete")
+            self.notify("Clipster", "Video metadata fetched successfully")
             return
 
 
@@ -2568,7 +2656,9 @@ class ClipsterApp:
                 messagebox.showerror(APP_NAME, "This video is age-restricted or members-only and requires sign-in. Clipster cannot download it.\n\nTip: use yt-dlp with a cookies file (manual).")
             else:
                 messagebox.showerror(APP_NAME, f"Failed to fetch metadata: {err}")
-            _toast(self, "Ready")
+        
+            self.notify("Clipster", "Ready")
+ 
             return
 
         if ev == "single_progress":
@@ -2588,7 +2678,7 @@ class ClipsterApp:
         if ev == "single_finished":
             output_path, fmt, embed_thumb, url = item[1], item[2], item[3], item[4]
             if not output_path:
-                outdir = self.settings.get("default_download_path", str(DOWNLOADS_DIR))
+                outdir = self.settings.get("default_download_path", WINDOWS_DOWNLOADS_DIR)
                 files = list(Path(outdir).glob("*"))
                 files = [f for f in files if f.is_file()]
                 if files:
@@ -2615,7 +2705,7 @@ class ClipsterApp:
                 "resolution": self.single_resolution_combo.get(),
                 "format": fmt,
                 "download_mode": "Single",
-                "download_path": str(Path(output_path).parent) if output_path else self.settings.get("default_download_path", str(DOWNLOADS_DIR)),
+                "download_path": str(Path(output_path).parent) if output_path else self.settings.get("default_download_path", WINDOWS_DOWNLOADS_DIR),
                 "thumbnail_embedded": bool(embedded_flag),
                 "redownloaded": False,
                 "date": now_str()
@@ -2627,6 +2717,8 @@ class ClipsterApp:
             _toast(self, "Download finished.", title="Complete", level="success", timeout=3500)
             _toast(self, f"Download finished: {Path(output_path).name}", title="Complete", timeout=4000)
             self.refresh_history()
+
+            self._reset_single_video_ui()
             return
 
         if ev == "single_error_restricted":
@@ -2733,7 +2825,7 @@ class ClipsterApp:
                 except Exception:
                     self.ui_queue.put(("playlist_thumb_ready", e.get("id"), None))
             if getattr(self, "_executor", None):
-                self._executor.submit(thumb_task, entry)
+                self.get_executor().submit(thumb_task, entry)
             else:
                 threading.Thread(target=thumb_task, args=(entry,), daemon=True).start()
             return
@@ -2771,6 +2863,8 @@ class ClipsterApp:
             return
 
         if ev == "history_thumb_ready":
+            if not hasattr(self, "history_scroll"):
+                return
             idx = item[1]
             thumb_path = item[2]
             for child in self.history_scroll.winfo_children():
