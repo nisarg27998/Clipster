@@ -2,14 +2,13 @@
 
 A modern, high-performance GUI video downloader powered by Python and `yt-dlp`.
 
-## 🚀 What's New in v1.2.6
-This release focuses on **engine reliability** and **app stability**:
+## 🚀 What's New in v1.2.7
+This release focuses on **user experience** and **startup polish**:
 
-* **Updated Downloader Engine:** Bundled with the latest `yt-dlp` to ensure compatibility with recent platform changes.
-* **Thread-Safe History:** Implemented a new locking system to ensure your download history saves correctly without crashes.
-* **Improved Process Handling:** Better management of background tasks—canceling a download now instantly frees up system resources.
-* **Bug Fixes:** Resolved internal errors that occurred during the initial app load.
-
+* **✨ New Splash Screen:** A smooth, fading splash screen now greets you on startup, masking the initial application load time.
+* **🧹 Clear History:** You can now easily wipe your entire download history with a single click.
+* **⚡ Engine Updates:** Includes the latest optimizations for `yt-dlp` interaction.
+* **Thread-Safe Core:** Continued improvements to the file locking system for history reliability.
 
 > **Fetch. Download. Enjoy.**
 

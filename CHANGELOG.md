@@ -6,6 +6,18 @@ All notable changes to **Clipster** are documented here.
 
 # Changelog
 
+## [1.2.7] - 2026-02-10
+### Added
+- **Splash Screen:** Added a modern splash screen on startup to mask the GUI initialization delay (`SplashScreen` class).
+- **Clear History:** Added functionality to clear the entire download history.
+- **Fade-out Animation:** Implemented smooth fade-out transitions for the splash screen.
+
+### Changed
+- **Startup Logic:** Refactored `main` execution to support the splash screen lifecycle before loading the main `ClipsterApp`.
+- Updated version constants to 1.2.7.
+
+---\
+
 ## [1.2.6] - 2026-02-02
 ### Added
 - Implementation of global locks for thread-safe history read/write operations to prevent data corruption.
@@ -41,18 +53,3 @@ All notable changes to **Clipster** are documented here.
 - ✅ Fixed rare UI race condition during history rendering.
 - ✅ Fixed `DownloadProcess.shutdown()` placeholder warning.
 - ✅ Removed unused `check_latest_version()` function.
-
----
-
-## 📦 v1.2.3 — *Refined, Reliable, and Polished* (November 2025)
-
-### Highlights
-- ⚡ Instant Startup (3× faster)
-- 🧩 ThreadPool stability and atomic JSON writes
-- 💾 Disk-space warnings
-- 🧾 Improved metadata fetching
-- 🎨 Mica titlebar and dynamic theming
-
----
-
-> “Fetch. Download. Enjoy.” — **Clipster**

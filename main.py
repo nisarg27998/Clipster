@@ -20,7 +20,7 @@ _HISTORY_RW_LOCK = threading.RLock()
 # Branding / Config
 # --------------------------------------------
 APP_NAME = "Clipster"
-APP_VERSION = "1.2.6"
+APP_VERSION = "1.2.7"
 ACCENT_COLOR = "#0078D7"
 SECONDARY_COLOR = "#00B7C2"
 SPLASH_TEXT = "Fetch. Download. Enjoy."
@@ -103,11 +103,7 @@ def run_subprocess_safe(cmd, timeout=300, cwd=None, capture_output=True):
 _SAFE_FILENAME_RE = re.compile(r'[^A-Za-z0-9 ._\-()]')
 
 
-def get_executor(self):
-    if self._executor is None:
-        import concurrent.futures
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=6)
-    return self._executor
+
 
 
 
@@ -785,7 +781,92 @@ def build_batch_format_selector(target_format, max_resolution_label):
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
+class SplashScreen(ctk.CTkToplevel):
+    def __init__(self, root):
+        super().__init__(root)
+
+        self.overrideredirect(True)
+        self.attributes("-topmost", True)
+        self.configure(fg_color="#121212")
+
+        width, height = 420, 260
+        x = (self.winfo_screenwidth() // 2) - (width // 2)
+        y = (self.winfo_screenheight() // 2) - (height // 2)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+
+        container = ctk.CTkFrame(
+            self,
+            corner_radius=18,
+            fg_color="#1a1a1a"
+        )
+        container.pack(expand=True, fill="both", padx=8, pady=8)
+
+        # Logo
+        try:
+            Image = get_pil_image()
+            logo_path = ASSETS_DIR / "clipster.png"
+            if logo_path.exists():
+                img = Image.open(logo_path).convert("RGBA")
+                img.thumbnail((72, 72))
+                self.logo_img = ctk.CTkImage(img, size=(72, 72))
+                ctk.CTkLabel(container, image=self.logo_img, text="").pack(pady=(24, 10))
+        except Exception:
+            pass
+
+        # App name
+        ctk.CTkLabel(
+            container,
+            text=APP_NAME,
+            font=ctk.CTkFont(size=22, weight="bold")
+        ).pack()
+
+        # Tagline
+        ctk.CTkLabel(
+            container,
+            text=SPLASH_TEXT,
+            font=ctk.CTkFont(size=13),
+            text_color="#9aa0a6"
+        ).pack(pady=(2, 18))
+
+        # Spinner
+        self.progress = ctk.CTkProgressBar(
+            container,
+            mode="indeterminate",
+            height=6,
+            corner_radius=6
+        )
+        self.progress.pack(fill="x", padx=60)
+        self.progress.start()
+
+        # Fade-in
+        self.attributes("-alpha", 0.0)
+        self._fade_in()
+
+    def _fade_in(self, alpha=0.0):
+        if alpha < 1.0:
+            alpha += 0.08
+            self.attributes("-alpha", alpha)
+            self.after(15, lambda: self._fade_in(alpha))
+
+    # ✅ NEW: Fade-out animation
+    def fade_out_and_destroy(self, alpha=1.0):
+        if alpha > 0:
+            alpha -= 0.08
+            self.attributes("-alpha", alpha)
+            self.after(15, lambda: self.fade_out_and_destroy(alpha))
+        else:
+            self.progress.stop()
+            self.destroy()
+
+
+
 class ClipsterApp:
+
+    def get_executor(self):
+        if self._executor is None:
+            import concurrent.futures
+            self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=6)
+        return self._executor
 
     def run_bg(self, func, *args):
         if getattr(self, "_executor", None):
@@ -2522,6 +2603,8 @@ class ClipsterApp:
             log_message(f"_reset_single_video_ui error: {e}")
 
 
+    
+
 
     def cancel_download(self):
         """Cancel current download."""
@@ -2919,17 +3002,20 @@ class ClipsterApp:
 
 if __name__ == "__main__":
     try:
-        ensure_directories()
+        ensure_directories()    
         root = ctk.CTk()
-        app = ClipsterApp(root)
+        root.withdraw()  # hide main window
 
-        # Schedule deferred tasks
-        root.after(100, lambda: threading.Thread(target=app.load_and_render_history, daemon=True).start())
-        root.after(2000, lambda: threading.Thread(target=app._check_for_updates, daemon=True).start())
+        splash = SplashScreen(root)
 
-        root.protocol("WM_DELETE_WINDOW", app._close_window)
+        def start_app():
+            splash.fade_out_and_destroy()  # ✨ fade-out
+            app = ClipsterApp(root)
+
+        # Keep splash visible for ~1.5 sec (or adjust)
+        root.after(1500, start_app)
+
         root.mainloop()
-
 
     except Exception as e:
         import traceback
