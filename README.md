@@ -1,4 +1,4 @@
-# Clipster v1.2.6
+# Clipster v1.2.7
 
 A modern, high-performance GUI video downloader powered by Python and `yt-dlp`.
 
