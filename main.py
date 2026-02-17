@@ -20,7 +20,7 @@ _HISTORY_RW_LOCK = threading.RLock()
 # Branding / Config
 # --------------------------------------------
 APP_NAME = "Clipster"
-APP_VERSION = "1.2.7"
+APP_VERSION = "1.2.8"
 ACCENT_COLOR = "#0078D7"
 SECONDARY_COLOR = "#00B7C2"
 SPLASH_TEXT = "Fetch. Download. Enjoy."
@@ -179,6 +179,7 @@ DEFAULT_SETTINGS = {
     "debug_mode": False,
     "default_format": "mp4",
     "theme": "dark",
+    "use_smart_naming": True,
 
     # default to user's Windows Downloads folder (cross-platform fallback)
     "default_download_path": WINDOWS_DOWNLOADS_DIR,
@@ -419,6 +420,32 @@ def show_toast(root, message, title=None, timeout=3000, level="info", theme="dar
     except Exception:
         pass
 
+# ------------------ Windows Native Notification ------------------
+
+def windows_notify(title, message, open_path=None):
+    try:
+        if not _is_windows():
+            return
+
+        from win11toast import toast
+
+        kwargs = {
+            "title": title,
+            "body": message,
+            "duration": "short"
+        }
+
+        if open_path and os.path.exists(open_path):
+            kwargs["on_click"] = lambda *_: os.startfile(open_path)
+
+        _ = toast(**kwargs)
+
+    except Exception as e:
+        log_message(f"windows_notify error: {e}")
+
+
+
+
 # convenience wrapper that checks settings
 def _toast(app, message, title=None, timeout=3000, level="info"):
     """Thread-safe wrapper for showing toasts."""
@@ -489,7 +516,25 @@ class DownloadProcess:
     def __init__(self):
         self.proc = None
         self._lock = threading.Lock()
-        
+        self.last_args = None
+        self.paused = False
+
+
+    def pause(self):
+        with self._lock:
+            if self.proc and self.proc.poll() is None:
+                try:
+                    self.proc.terminate()
+                    self.paused = True
+                except Exception:
+                    pass
+
+
+    def resume(self):
+        if self.paused and self.last_args:
+            self.paused = False
+            self.start_download(*self.last_args)
+
 
     def shutdown(self):
         with self._lock:
@@ -506,6 +551,17 @@ class DownloadProcess:
 
     def start_download(self, url, outdir, filename_template, format_selector, cookies_path=None, progress_callback=None, finished_callback=None, error_callback=None):
         """Start a download thread."""
+        self.last_args = (
+            url,
+            outdir,
+            filename_template,
+            format_selector,
+            cookies_path,
+            progress_callback,
+            finished_callback,
+            error_callback,
+        )
+        self.paused = False
         thread = threading.Thread(target=self._run_download, args=(url, outdir, filename_template, format_selector, cookies_path, progress_callback, finished_callback, error_callback), daemon=True)
         thread.start()
         return thread
@@ -861,6 +917,16 @@ class SplashScreen(ctk.CTkToplevel):
 
 
 class ClipsterApp:
+
+    def pause_download(self):
+        self.download_proc.pause()
+        self.single_pause_btn.configure(text="Resume", command=self.resume_download)
+        _toast(self, "Download paused.", title="Paused")
+
+    def resume_download(self):
+        self.download_proc.resume()
+        self.single_pause_btn.configure(text="Pause", command=self.pause_download)
+        _toast(self, "Resuming download...", title="Resume")
 
     def get_executor(self):
         if self._executor is None:
@@ -1566,6 +1632,18 @@ class ClipsterApp:
         self.single_cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", height=36, corner_radius=8, command=self.cancel_download)
         self.single_cancel_btn.pack(side="left", padx=6)
 
+        
+
+        self.single_pause_btn = ctk.CTkButton(
+            btn_frame,
+            text="Pause",
+            height=36,
+            corner_radius=8,
+            command=self.pause_download
+        )
+        self.single_pause_btn.pack(side="left", padx=6)
+        self.single_pause_btn.configure(state="disabled")
+
         ctk.CTkLabel(left, text="Progress:", anchor="w").pack(padx=8, pady=(6, 0))
         self.single_progress = ctk.CTkProgressBar(left, width=320, height=8, corner_radius=4)
         self.single_progress.set(0)
@@ -1777,8 +1855,12 @@ class ClipsterApp:
 
     def refresh_history(self):
         """Refresh history list UI."""
-        for widget in self.history_scroll.winfo_children():
-            widget.destroy()
+        for widget in list(self.history_scroll.winfo_children()):
+            try:
+                if widget.winfo_exists():
+                    widget.destroy()
+            except Exception:
+                pass
         self._history_thumb_imgs.clear()
         self.history = load_history()
         if not self.history:
@@ -2175,17 +2257,23 @@ class ClipsterApp:
         embed_thumb = False
         res_label = self.single_resolution_combo.get()
         outdir = self.settings.get("default_download_path", WINDOWS_DOWNLOADS_DIR)
+        Path(outdir).mkdir(parents=True, exist_ok=True)
         total, used, free = shutil.disk_usage(outdir)
         if free < 500 * 1024 * 1024:
             messagebox.showwarning(APP_NAME, "Low disk space detected! You may run out during download.")
         fmt_selector = build_format_selector_for_format_and_res(fmt, res_label)
-        filename_template = "%(title)s.%(ext)s"
+        if self.settings.get("use_smart_naming", True):
+            filename_template = "%(uploader)s - %(title)s.%(ext)s"
+        else:
+            filename_template = "%(title)s.%(ext)s"
         self.single_download_btn.configure(state="disabled")
         # cancel button removed; notify user with a toast instead
         _toast(self, "Download started...", title="Download", timeout=3000)
         self.single_progress.set(0)
         self.single_progress_label.configure(text="Starting...")
         self.current_task_cancelled = False
+
+        self.single_pause_btn.configure(state="normal")
 
         cookies_path = self.settings.get("cookies_path", "") or None
 
@@ -2223,7 +2311,7 @@ class ClipsterApp:
         max_res = self.batch_maxres_combo.get()
         embed_thumb = False  # embed removed permanently
         outdir = self.settings.get("default_download_path", WINDOWS_DOWNLOADS_DIR)
-
+        Path(outdir).mkdir(parents=True, exist_ok=True)
         total, used, free = shutil.disk_usage(outdir)
         if free < 500 * 1024 * 1024:
             messagebox.showwarning(APP_NAME, "Low disk space detected! You may run out during download.")
@@ -2236,6 +2324,8 @@ class ClipsterApp:
         completed = 0
         self.current_task_cancelled = False
         _toast(self, f"Downloading {total_count} videos...", title="Batch")
+
+        self.single_pause_btn.configure(state="disabled")
 
         def batch_task():
             nonlocal completed
@@ -2260,8 +2350,14 @@ class ClipsterApp:
                     self.ui_queue.put(("batch_item_error", idx, str(err)))
                     finished_event.set()
 
+                filename_template = (
+                    "%(uploader)s - %(title)s.%(ext)s"
+                    if self.settings.get("use_smart_naming", True)
+                    else "%(title)s.%(ext)s"
+                )
+
                 # Run single download
-                self.download_proc.start_download(url, outdir, "%(title)s.%(ext)s", fmt_selector,
+                self.download_proc.start_download(url, outdir, filename_template, fmt_selector,
                                                 cookies_path, progress_callback, finished_callback, error_callback)
 
                 while not finished_event.is_set():
@@ -2377,6 +2473,7 @@ class ClipsterApp:
         max_res = self.playlist_maxres_combo.get()
         embed_thumb = False
         outdir = self.settings.get("default_download_path", WINDOWS_DOWNLOADS_DIR)
+        Path(outdir).mkdir(parents=True, exist_ok=True)
         total, used, free = shutil.disk_usage(outdir)
         if free < 500 * 1024 * 1024:
             messagebox.showwarning(APP_NAME, "Low disk space detected! You may run out during download.")
@@ -2417,7 +2514,13 @@ class ClipsterApp:
                     self.ui_queue.put(("playlist_row_error", vid, str(err)))
                     finished_event.set()
 
-                self.download_proc.start_download(url, outdir, "%(title)s.%(ext)s", fmt_selector, cookies_path, progress_callback, finished_callback, error_callback)
+                filename_template = (
+                    "%(uploader)s - %(title)s.%(ext)s"
+                    if self.settings.get("use_smart_naming", True)
+                    else "%(title)s.%(ext)s"
+                )
+
+                self.download_proc.start_download(url, outdir, filename_template, fmt_selector, cookies_path, progress_callback, finished_callback, error_callback)
 
                 while not finished_event.is_set():
                     if self.current_task_cancelled:
@@ -2547,7 +2650,14 @@ class ClipsterApp:
             self.refresh_history()
         def error_callback(err):
             self.ui_queue.put(("redownload_error", str(err)))
-        self.download_proc.start_download(url, outdir, "%(title)s.%(ext)s", fmt_selector, cookies_path, progress_callback, finished_callback, error_callback)
+
+        filename_template = (
+            "%(uploader)s - %(title)s.%(ext)s"
+            if self.settings.get("use_smart_naming", True)
+            else "%(title)s.%(ext)s"
+        )
+
+        self.download_proc.start_download(url, outdir, filename_template, fmt_selector, cookies_path, progress_callback, finished_callback, error_callback)
 
     def safe_ui_call(self, func, *args, **kwargs):
         """Schedule a UI call on mainloop thread but guard against destroyed widgets."""
@@ -2608,6 +2718,9 @@ class ClipsterApp:
 
     def cancel_download(self):
         """Cancel current download."""
+        self.download_proc.paused = False
+        self.download_proc.last_args = None
+        self.single_pause_btn.configure(state="disabled", text="Pause", command=self.pause_download)
         self.current_task_cancelled = True
         self.download_proc.cancel()
         try:
@@ -2621,7 +2734,10 @@ class ClipsterApp:
         try:
             while True:
                 item = self.ui_queue.get_nowait()
-                self._handle_ui_event(item)
+                try:
+                    self._handle_ui_event(item)
+                except Exception as e:
+                    log_message(f"UI event error: {e}")
         except queue.Empty:
             pass
         self.root.after(100, self._process_ui_queue)
@@ -2734,6 +2850,7 @@ class ClipsterApp:
             return
 
         if ev == "single_finished":
+            self.single_pause_btn.configure(text="Pause", command=self.pause_download)
             output_path, fmt, embed_thumb, url = item[1], item[2], item[3], item[4]
             if not output_path:
                 outdir = self.settings.get("default_download_path", WINDOWS_DOWNLOADS_DIR)
@@ -2772,8 +2889,15 @@ class ClipsterApp:
             self.single_download_btn.configure(state="normal")
             self.single_progress.set(0)
             self.single_progress_label.configure(text="")
-            _toast(self, "Download finished.", title="Complete", level="success", timeout=3500)
-            _toast(self, f"Download finished: {Path(output_path).name}", title="Complete", timeout=4000)
+            filename = Path(output_path).name if output_path else "File"
+            windows_notify(
+                "Clipster",
+                f"Download finished:\n{filename}",
+                open_path=output_path
+            )
+
+            self.single_pause_btn.configure(state="disabled")
+            #_toast(self, f"Download finished:\n{Path(output_path).name}", title="Complete", timeout=4000)
             self.refresh_history()
 
             self._reset_single_video_ui()
@@ -2825,7 +2949,11 @@ class ClipsterApp:
         if ev == "batch_finished":
             completed, total = item[1], item[2]
             self.batch_overall_progress.set(1.0)
-            _toast(self, f"Batch finished: {completed}/{total}", title="Batch", timeout=3500)
+            windows_notify(
+                "Clipster",
+                f"Batch finished: {completed}/{total} downloads complete."
+            )
+            #_toast(self, f"Batch finished: {completed}/{total}", title="Batch", timeout=3500)
             self.refresh_history()
             return
 
@@ -2946,8 +3074,14 @@ class ClipsterApp:
 
         if ev == "redownload_finished":
             output_path = item[1]
-            _toast(self, "Re-download finished.", title="Re-Download", timeout=3000)
-            _toast(self, f"Re-download finished: {Path(output_path).name}", title="Re-Download", timeout=3500)
+            filename = Path(output_path).name if output_path else "File"
+            windows_notify(
+                "Clipster",
+                f"Re-download finished:\n{filename}",
+                open_path=output_path
+            )
+            #_toast(self, "Re-download finished.", title="Re-Download", timeout=3000)
+            #_toast(self, f"Re-download finished: {Path(output_path).name}", title="Re-Download", timeout=3500)
             self.refresh_history()
             return
 
@@ -2961,10 +3095,11 @@ class ClipsterApp:
             row = self._playlist_row_by_vid.get(vid)
             if row and hasattr(row, "_progress"):
                 try:
-                    row._progress.set(pval)
+                    if row._progress.winfo_exists():
+                        row._progress.set(pval)
                 except Exception:
                     pass
-            return
+
 
         if ev == "playlist_row_error":
             vid, err = item[1], item[2]
@@ -2972,7 +3107,11 @@ class ClipsterApp:
             if row:
                 try:
                     if hasattr(row, "_progress"):
-                        row._progress.destroy()
+                        try:
+                            if row._progress.winfo_exists():
+                                row._progress.destroy()
+                        except Exception:
+                            pass
                 except Exception:
                     pass
             messagebox.showerror(APP_NAME, f"Playlist item error: {err}")
@@ -2996,7 +3135,11 @@ class ClipsterApp:
         if ev == "playlist_seq_finished":
             completed, total = item[1], item[2]
             self.playlist_overall_progress.set(1.0)
-            _toast(self, f"Playlist finished: {completed}/{total}", timeout=3500)
+            windows_notify(
+                "Clipster",
+                f"Playlist finished: {completed}/{total} downloads complete."
+            )
+            #_toast(self, f"Playlist finished: {completed}/{total}", timeout=3500)
             self.refresh_history()
             return
 

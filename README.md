@@ -1,16 +1,25 @@
-# Clipster v1.2.7
+## 🚀 What's New in v1.2.8
 
-A modern, high-performance GUI video downloader powered by Python and `yt-dlp`.
+This release focuses on **Windows-native integration and stability**:
 
-## 🚀 What's New in v1.2.7
-This release focuses on **user experience** and **startup polish**:
+* 🔔 **Windows Native Notifications**
+  - Real Windows 11 notifications (click to open file).
+  - Cleaner experience — no more duplicate toasts.
 
-* **✨ New Splash Screen:** A smooth, fading splash screen now greets you on startup, masking the initial application load time.
-* **🧹 Clear History:** You can now easily wipe your entire download history with a single click.
-* **⚡ Engine Updates:** Includes the latest optimizations for `yt-dlp` interaction.
-* **Thread-Safe Core:** Continued improvements to the file locking system for history reliability.
+* ⏸️ **Pause / Resume Downloads**
+  - Pause and resume single video downloads.
+  - Improved process control & safe termination.
 
-> **Fetch. Download. Enjoy.**
+* 🗂️ Smart Download Naming
+  - Unified filename templates across all download modes.
+  - Safer sanitization & folder handling.
+
+* 🛠 Stability Enhancements
+  - Hardened UI thread-safety.
+  - Improved background worker shutdown.
+  - More reliable history storage (atomic JSON writes).
+
+> Fetch. Download. Enjoy.
 
 ---
 
@@ -21,7 +30,7 @@ This release focuses on **user experience** and **startup polish**:
 
 1. Visit the **Releases Page**:
    👉 [https://github.com/nisarg27998/Clipster/releases](https://github.com/nisarg27998/Clipster/releases)
-2. Download **Clipster v1.2.5 (.exe)**
+2. Download **Clipster v1.2.8 (.exe)**
 3. Run directly — **no installation required**
 
 ### 📦 Bundled Tools

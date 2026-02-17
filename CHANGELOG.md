@@ -6,6 +6,44 @@ All notable changes to **Clipster** are documented here.
 
 # Changelog
 
+## [1.2.8] - 2026-02-17
+
+### 🚀 Major Improvements
+
+- 🔔 **Windows Native Notifications**
+  - Replaced in-app completion toasts with real Windows 11 notifications.
+  - Click notification to open downloaded file.
+  - Cleaner, OS-integrated experience.
+
+- ⏸️ **Pause / Resume Support (Single Downloads)**
+  - Added pause & resume functionality for active downloads.
+  - Proper state reset on cancel.
+  - Stable process termination handling.
+
+- 🗂️ **Smart Download Folder Naming**
+  - Consistent filename templates across:
+    - Single downloads
+    - Batch downloads
+    - Playlist downloads
+    - Re-downloads
+  - Safer filename sanitization.
+
+### 🛠 Stability & Architecture
+
+- Hardened UI thread safety using guarded `winfo_exists()` checks.
+- Improved atomic JSON history writes.
+- Improved subprocess handling & Windows console suppression.
+- Improved shutdown logic for executor & background workers.
+
+### 🎨 UI & UX
+
+- Better progress synchronization in batch & playlist modes.
+- Cleaner toast logic with thread-safe wrapper.
+- Improved history thumbnail handling.
+- Minor UI polish & consistency fixes.
+
+---
+
 ## [1.2.7] - 2026-02-10
 ### Added
 - **Splash Screen:** Added a modern splash screen on startup to mask the GUI initialization delay (`SplashScreen` class).
