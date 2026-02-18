@@ -6,6 +6,48 @@ All notable changes to **Clipster** are documented here.
 
 # Changelog
 
+## [1.2.9] - 2026-02-18
+
+### 🚀 Stability & Architecture Improvements
+
+- Added `run_subprocess_safe()` for consistent, hidden subprocess execution.
+- Improved atomic JSON write locking with timeout fallback logging.
+- Hardened `safe_ui_call()` to prevent UI race-condition crashes.
+- Improved graceful shutdown logic (executor + temp cleanup).
+- More reliable output file detection after downloads.
+- Improved disk space pre-check validation.
+
+### 📥 Download Flow Improvements
+
+- Batch downloads:
+  - Improved per-item completion tracking.
+  - Better fallback output path detection.
+  - Cleaner structured history entries.
+- Playlist sequential downloads now more stable.
+- Pause/Resume state handling improved.
+
+### 🖼 Thumbnail & Media Enhancements
+
+- Smarter YouTube thumbnail resolution fallback:
+  - `maxresdefault` → `sddefault` → `hqdefault` → `mqdefault`
+- Improved thumbnail caching in History tab.
+- Safer FFmpeg atomic replacement logic when embedding thumbnails.
+
+### 🎨 UI & UX Improvements
+
+- Improved spinner overlay positioning and rounding.
+- Optimized titlebar icon loading (deferred PNG load).
+- Better playlist overall progress placement.
+- Consistent rounded corners across menus.
+- Instant theme switching from Settings tab.
+
+### 🔔 Notifications
+
+- Improved thread-safe toast wrapper.
+- Hardened Windows native notification integration.
+
+---
+
 ## [1.2.8] - 2026-02-17
 
 ### 🚀 Major Improvements

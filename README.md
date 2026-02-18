@@ -1,23 +1,30 @@
-## 🚀 What's New in v1.2.8
+## 🚀 What's New in v1.2.9
 
-This release focuses on **Windows-native integration and stability**:
+This update focuses on **stability, reliability, and polish**.
 
-* 🔔 **Windows Native Notifications**
-  - Real Windows 11 notifications (click to open file).
-  - Cleaner experience — no more duplicate toasts.
+### 🔧 Stability Upgrades
+- Improved subprocess handling (`run_subprocess_safe()`).
+- Stronger atomic JSON history writes with lock fallback.
+- Hardened UI thread safety with safer mainloop scheduling.
+- Improved shutdown logic and temp file cleanup.
 
-* ⏸️ **Pause / Resume Downloads**
-  - Pause and resume single video downloads.
-  - Improved process control & safe termination.
+### 📥 Download Improvements
+- More reliable batch and playlist completion tracking.
+- Better output file detection after downloads.
+- Improved pause/resume handling.
+- Smarter disk space validation before downloads.
 
-* 🗂️ Smart Download Naming
-  - Unified filename templates across all download modes.
-  - Safer sanitization & folder handling.
+### 🖼 Smarter Thumbnail Handling
+- Automatic high-quality thumbnail fallback:
+  `maxres → sd → hq → mq`
+- Improved history thumbnail caching.
+- Safer FFmpeg thumbnail embedding logic.
 
-* 🛠 Stability Enhancements
-  - Hardened UI thread-safety.
-  - Improved background worker shutdown.
-  - More reliable history storage (atomic JSON writes).
+### 🎨 UI Polish
+- Improved spinner overlay positioning.
+- Optimized custom titlebar icon loading.
+- Consistent rounded corners.
+- Instant theme switching in Settings.
 
 > Fetch. Download. Enjoy.
 

@@ -20,7 +20,7 @@ _HISTORY_RW_LOCK = threading.RLock()
 # Branding / Config
 # --------------------------------------------
 APP_NAME = "Clipster"
-APP_VERSION = "1.2.8"
+APP_VERSION = "1.2.9"
 ACCENT_COLOR = "#0078D7"
 SECONDARY_COLOR = "#00B7C2"
 SPLASH_TEXT = "Fetch. Download. Enjoy."
@@ -44,7 +44,7 @@ FFMPEG_EXE = ASSETS_DIR / "ffmpeg.exe"
 FFPROBE_EXE = ASSETS_DIR / "ffprobe.exe"
 FFPLAY_EXE = ASSETS_DIR / "ffplay.exe"
 
-ALLOWED_FORMATS = ["mp4", "mkv", "webm", "m4a"]
+ALLOWED_FORMATS = ["mp4", "mkv", "webm", "m4a", "mp3"]
 
 YOUTUBE_URL_RE = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+", re.IGNORECASE)
 YT_DLP_PROGRESS_RE = re.compile(r"\[download\]\s+([\d\.]+)%")
@@ -140,13 +140,12 @@ def log_message(msg: str):
 def log_debug(msg):
     try:
         settings = None
-        # If app exists on module level, try to read debug flag
         if 'app' in globals() and getattr(globals()['app'], 'settings', None):
             settings = globals()['app'].settings
         if settings and settings.get("debug_mode"):
             log_message("[DEBUG] " + msg)
     except Exception:
-        log_message("[DEBUG] " + msg)
+        pass
 
 
 def open_log_file():
@@ -159,10 +158,14 @@ def open_log_file():
     except Exception as e:
         messagebox.showerror(APP_NAME, f"Unable to open log file:\n{e}")
 
+HISTORY_MAX_ENTRIES = 200
+TEMP_FILE_MAX_AGE_DAYS = 7
+
 def ensure_directories():
-    """Ensure required directories exist."""
+    """Ensure required directories exist and purge stale temp files."""
     DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
     TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    _purge_old_temp_files()
 
 def check_executables():
     """Check for required executables in Assets/."""
@@ -221,11 +224,28 @@ def load_history():
         return data
 
 
+def _purge_old_temp_files():
+    """Delete temp files older than TEMP_FILE_MAX_AGE_DAYS. Best-effort, never raises."""
+    try:
+        cutoff = time.time() - TEMP_FILE_MAX_AGE_DAYS * 86400
+        for p in TEMP_DIR.iterdir():
+            try:
+                if p.is_file() and p.stat().st_mtime < cutoff:
+                    p.unlink(missing_ok=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def append_history(entry):
     # Fix: Atomic read-modify-write cycle
     with _HISTORY_RW_LOCK:
         history = load_history() or []
         history.insert(0, entry)
+        # Cap history to prevent unbounded growth
+        if len(history) > HISTORY_MAX_ENTRIES:
+            history = history[:HISTORY_MAX_ENTRIES]
         safe_write_json(HISTORY_FILE, history)
 
 
@@ -575,7 +595,10 @@ class DownloadProcess:
         cmd = [windows_quote(str(YT_DLP_EXE)), "--no-warnings", "--newline"]
         if cookies_path:
             cmd += ["--cookies", windows_quote(cookies_path)]
-        cmd += ["-o", outtmpl, "-f", format_selector, url]
+        if format_selector == "__mp3__":
+            cmd += ["-o", outtmpl, "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0", url]
+        else:
+            cmd += ["-o", outtmpl, "-f", format_selector, url]
 
         try:
             popen_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT, "text": True, "bufsize": 1, "universal_newlines": True}
@@ -657,15 +680,17 @@ class DownloadProcess:
 # --------------------------------------------
 def download_thumbnail(url, target_filename=None, timeout=20):
     import requests, shutil
-    """Download thumbnail from URL to user's Downloads folder."""
+    """Download thumbnail from URL. If target_filename is an absolute path,
+    save there directly. Otherwise save to the user's Downloads folder."""
     try:
-        downloads_path = str(Path.home() / "Downloads")
-        os.makedirs(downloads_path, exist_ok=True)
-        if not target_filename:
-            filename = f"clipster_thumb_{int(time.time())}.jpg"
+        if target_filename and Path(target_filename).is_absolute():
+            target_path = str(target_filename)
+            Path(target_path).parent.mkdir(parents=True, exist_ok=True)
         else:
-            filename = target_filename
-        target_path = os.path.join(downloads_path, filename)
+            downloads_path = str(Path.home() / "Downloads")
+            os.makedirs(downloads_path, exist_ok=True)
+            filename = target_filename if target_filename else f"clipster_thumb_{int(time.time())}.jpg"
+            target_path = os.path.join(downloads_path, filename)
 
         r = requests.get(url, stream=True, timeout=timeout)
         r.raise_for_status()
@@ -805,6 +830,8 @@ def build_format_selector_for_format_and_res(target_format, resolution_label):
         return "bestvideo[ext=webm]+bestaudio[ext=webm]/best"
     if target_format == "mkv":
         return "bestvideo[ext=mkv]+bestaudio/best"
+    if target_format == "mp3":
+        return "__mp3__"
     return "best"
 
 def resolution_to_height(res_label):
@@ -820,6 +847,8 @@ def resolution_to_height(res_label):
 
 def build_batch_format_selector(target_format, max_resolution_label):
     """Build format selector for batch/playlist downloads."""
+    if target_format == "mp3":
+        return "__mp3__"
     height = resolution_to_height(max_resolution_label)
     if height:
         if target_format == "mp4":
@@ -1007,80 +1036,75 @@ class ClipsterApp:
 
 
     def _check_for_updates(self):
-        """Check GitHub API for newer releases."""
+        """Check GitHub API for newer releases. Runs in background thread — no direct UI calls."""
         import requests
+        # Signal UI that check has started
+        self.ui_queue.put(("update_status", "Checking GitHub..."))
         try:
-            self.update_status_label.configure(text="Checking GitHub...")
             r = requests.get(GITHUB_API_LATEST, timeout=6)
             if r.status_code != 200:
-                self.update_status_label.configure(text=f"Failed to fetch release info ({r.status_code})")
+                self.ui_queue.put(("update_status", f"Failed to fetch release info ({r.status_code})"))
                 return
             data = r.json()
             latest = data.get("tag_name", "").lstrip("v")
             if not latest:
-                self.update_status_label.configure(text="No valid release found.")
+                self.ui_queue.put(("update_status", "No valid release found."))
                 return
             if latest == APP_VERSION:
-                self.update_status_label.configure(text=f"✅ You’re running the latest version ({APP_VERSION}).")
+                self.ui_queue.put(("update_status", f"✅ You’re running the latest version ({APP_VERSION})."))
             else:
-                self.update_status_label.configure(
-                    text=f"🆕 New version available: {latest}\n(Current: {APP_VERSION})"
-                )
-                self.latest_release_data = data
+                self.ui_queue.put(("update_available", latest, data))
         except Exception as e:
-            self.update_status_label.configure(text=f"Failed to check updates: {e}")
-        
+            self.ui_queue.put(("update_status", f"Failed to check updates: {e}"))
 
     def _check_update_button(self):
         threading.Thread(target=self._check_for_updates, daemon=True).start()
 
     def _download_and_install_update(self):
+        """Download latest EXE in a background thread to avoid freezing the UI."""
         import requests
-        import shutil
-        """Download latest EXE and replace the current one."""
-        try:
-            data = getattr(self, "latest_release_data", None)
-            if not data:
-                messagebox.showinfo(APP_NAME, "Please check for updates first.")
-                return
-            assets = data.get("assets", [])
-            exe_url = None
-            for asset in assets:
-                if asset["name"].endswith(".exe"):
-                    exe_url = asset["browser_download_url"]
-                    break
-            if not exe_url:
-                messagebox.showinfo(APP_NAME, "No .exe found in latest release assets.")
-                return
+        data = getattr(self, "latest_release_data", None)
+        if not data:
+            messagebox.showinfo(APP_NAME, "Please check for updates first.")
+            return
+        assets = data.get("assets", [])
+        exe_url = None
+        for asset in assets:
+            if asset["name"].endswith(".exe"):
+                exe_url = asset["browser_download_url"]
+                break
+        if not exe_url:
+            messagebox.showinfo(APP_NAME, "No .exe found in latest release assets.")
+            return
 
-            try: self.show_spinner("Downloading latest version...")
-            except Exception: pass
-            new_exe_path = TEMP_DIR / "Clipster_Update.exe"
-            with requests.get(exe_url, stream=True, timeout=30) as r:
-                r.raise_for_status()
-                total = int(r.headers.get("Content-Length", 0))
-                with open(new_exe_path, "wb") as f:
-                    downloaded = 0
-                    for chunk in r.iter_content(chunk_size=8192):
-                        if not chunk:
-                            continue
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if total:
-                            percent = downloaded * 100 // total
-                            self.update_status_label.configure(text=f"Downloading... {percent}%")
+        try: self.show_spinner("Downloading latest version...")
+        except Exception: pass
+        self.ui_queue.put(("update_status", "Starting download..."))
 
-            try: self.hide_spinner()
-            except Exception: pass
-            self.update_status_label.configure(text="✅ Download complete. Installing update...")
+        def _do_download():
+            import requests
+            try:
+                new_exe_path = TEMP_DIR / "Clipster_Update.exe"
+                with requests.get(exe_url, stream=True, timeout=30) as r:
+                    r.raise_for_status()
+                    total = int(r.headers.get("Content-Length", 0))
+                    with open(new_exe_path, "wb") as f:
+                        downloaded = 0
+                        for chunk in r.iter_content(chunk_size=8192):
+                            if not chunk:
+                                continue
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if total:
+                                percent = downloaded * 100 // total
+                                self.ui_queue.put(("update_status", f"Downloading... {percent}%"))
+                self.ui_queue.put(("update_install", str(new_exe_path)))
+            except Exception as e:
+                self.ui_queue.put(("update_status", f"Download failed: {e}"))
+                try: self.hide_spinner()
+                except Exception: pass
 
-            # Run new exe and exit current app
-            os.startfile(str(new_exe_path))
-            self._close_window()
-
-        except Exception as e:
-            self.hide_spinner()
-            messagebox.showerror(APP_NAME, f"Update failed: {e}")
+        threading.Thread(target=_do_download, daemon=True).start()
 
     def _deferred_executables_check(self):
         try:
@@ -1619,9 +1643,12 @@ class ClipsterApp:
         fmt_frame.pack(fill="x", padx=8, pady=(8, 4))
         ctk.CTkLabel(fmt_frame, text="Format:", anchor="w", width=100).pack(side="left", padx=(0, 8))
         self.single_format_combo = ctk.CTkComboBox(fmt_frame, values=ALLOWED_FORMATS, width=250, 
-                                                    height=36, corner_radius=8)
+                                                    height=36, corner_radius=8,
+                                                    command=self._on_single_format_changed)
         self.single_format_combo.set(self.settings.get("default_format", "mp4"))
         self.single_format_combo.pack(side="left")
+        # Apply initial state in case saved default is mp3
+        self._on_single_format_changed(self.single_format_combo.get())
 
         
 
@@ -1943,9 +1970,14 @@ class ClipsterApp:
 
         title = entry.get("title", "<No title>")
         uploader = entry.get("uploader", "")
+        fmt = entry.get("format", "").upper()
         res = entry.get("resolution", "")
         date = entry.get("date", "")
-        info_text = f"{uploader} • {res} • {date}"
+        # For audio-only formats, skip the redundant resolution field
+        if fmt in ("MP3", "M4A") or res == "N/A (Audio Only)":
+            info_text = f"{uploader} • {fmt} • {date}"
+        else:
+            info_text = f"{uploader} • {fmt} {res} • {date}"
         title_lbl = ctk.CTkLabel(row_frame, text=title, anchor="w", font=ctk.CTkFont(size=13, weight="bold"))
         title_lbl.grid(row=0, column=1, sticky="w", padx=(0,8), pady=(8,0))
         info_lbl = ctk.CTkLabel(row_frame, text=info_text, anchor="w", font=ctk.CTkFont(size=10))
@@ -2677,6 +2709,18 @@ class ClipsterApp:
         except Exception:
             pass
 
+    def _on_single_format_changed(self, choice):
+        """Disable resolution combo when an audio-only format is selected."""
+        audio_only = choice in ("mp3", "m4a")
+        if audio_only:
+            self.single_resolution_combo.configure(state="disabled")
+            self.single_resolution_combo.set("N/A (Audio Only)")
+        else:
+            self.single_resolution_combo.configure(state="normal")
+            current = self.single_resolution_combo.get()
+            if current == "N/A (Audio Only)":
+                self.single_resolution_combo.set("Best Available")
+
     def _reset_single_video_ui(self):
         """Reset Single Video tab UI for next download."""
         try:
@@ -2897,7 +2941,6 @@ class ClipsterApp:
             )
 
             self.single_pause_btn.configure(state="disabled")
-            #_toast(self, f"Download finished:\n{Path(output_path).name}", title="Complete", timeout=4000)
             self.refresh_history()
 
             self._reset_single_video_ui()
@@ -2953,7 +2996,6 @@ class ClipsterApp:
                 "Clipster",
                 f"Batch finished: {completed}/{total} downloads complete."
             )
-            #_toast(self, f"Batch finished: {completed}/{total}", title="Batch", timeout=3500)
             self.refresh_history()
             return
 
@@ -3080,8 +3122,6 @@ class ClipsterApp:
                 f"Re-download finished:\n{filename}",
                 open_path=output_path
             )
-            #_toast(self, "Re-download finished.", title="Re-Download", timeout=3000)
-            #_toast(self, f"Re-download finished: {Path(output_path).name}", title="Re-Download", timeout=3500)
             self.refresh_history()
             return
 
@@ -3139,8 +3179,37 @@ class ClipsterApp:
                 "Clipster",
                 f"Playlist finished: {completed}/{total} downloads complete."
             )
-            #_toast(self, f"Playlist finished: {completed}/{total}", timeout=3500)
             self.refresh_history()
+            return
+
+        if ev == "update_status":
+            try:
+                self.update_status_label.configure(text=item[1])
+            except Exception:
+                pass
+            return
+
+        if ev == "update_available":
+            latest, data = item[1], item[2]
+            self.latest_release_data = data
+            try:
+                self.update_status_label.configure(
+                    text=f"🆕 New version available: {latest}\n(Current: {APP_VERSION})"
+                )
+            except Exception:
+                pass
+            return
+
+        if ev == "update_install":
+            new_exe_path = item[1]
+            try: self.hide_spinner()
+            except Exception: pass
+            try:
+                self.update_status_label.configure(text="✅ Download complete. Installing update...")
+            except Exception:
+                pass
+            os.startfile(new_exe_path)
+            self._close_window()
             return
 
 if __name__ == "__main__":
