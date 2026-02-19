@@ -6,6 +6,50 @@ All notable changes to **Clipster** are documented here.
 
 # Changelog
 
+## [1.3.0] - 2026-02-19
+
+### 🚀 Major UI & Experience Upgrade
+
+- Fully refined Windows 11 custom titlebar:
+  - Native drag behavior
+  - Proper maximize / restore animations
+  - Rounded corner integration
+  - Improved light theme contrast (fixed white icons issue)
+- Enhanced Mica effect synchronization with theme switching
+- Improved window animation transitions (minimize / restore)
+
+### 📥 Download Enhancements
+
+- Improved single download progress synchronization
+- Better UI state reset after completion
+- Improved playlist incremental rendering performance
+- Optimized background thread usage with executor fallback
+
+### 🧠 Architecture Improvements
+
+- Better deferred executable checks to improve startup time
+- Safer thumbnail rendering pipeline
+- Improved history loading delay logic
+- Improved thread-safe UI queue handling
+- More consistent state cleanup during shutdown
+
+### 🎨 UI Polish
+
+- Better spinner overlay positioning
+- Consistent rounded corners across all dialogs
+- Improved dropdown rendering
+- Cleaner progress bar styling
+- Improved light/dark theme switching consistency
+
+### 🔒 Stability Improvements
+
+- Safer background thread handling
+- Reduced race-condition edge cases
+- Improved process cancellation handling
+- More resilient playlist fetch logic
+
+---
+
 ## [1.2.9] - 2026-02-18
 
 ### 🚀 Stability & Architecture Improvements

@@ -1,30 +1,22 @@
-## 🚀 What's New in v1.2.9
+## 🚀 What's New in v1.3.0
 
-This update focuses on **stability, reliability, and polish**.
+This update delivers a **major Windows 11 UI refinement** and stronger architecture stability.
 
-### 🔧 Stability Upgrades
-- Improved subprocess handling (`run_subprocess_safe()`).
-- Stronger atomic JSON history writes with lock fallback.
-- Hardened UI thread safety with safer mainloop scheduling.
-- Improved shutdown logic and temp file cleanup.
+### 🪟 Windows 11 UI Upgrade
+- Fully custom native-feeling titlebar
+- Proper maximize / restore animations
+- Rounded window corners
+- Improved light theme visibility
+- Better Mica synchronization
 
 ### 📥 Download Improvements
-- More reliable batch and playlist completion tracking.
-- Better output file detection after downloads.
-- Improved pause/resume handling.
-- Smarter disk space validation before downloads.
+- Better progress synchronization
+- Improved background thread handling
 
-### 🖼 Smarter Thumbnail Handling
-- Automatic high-quality thumbnail fallback:
-  `maxres → sd → hq → mq`
-- Improved history thumbnail caching.
-- Safer FFmpeg thumbnail embedding logic.
-
-### 🎨 UI Polish
-- Improved spinner overlay positioning.
-- Optimized custom titlebar icon loading.
-- Consistent rounded corners.
-- Instant theme switching in Settings.
+### 🧠 Stability & Performance
+- Faster startup with deferred checks
+- Improved history rendering safety
+- Hardened shutdown behavior
 
 > Fetch. Download. Enjoy.
 
@@ -74,15 +66,6 @@ Clipster ships fully portable with:
 * Windows 10 or Windows 11 (64-bit)
 * Recommended: 8 GB RAM or higher
 * Active internet connection
-
----
-
-## 🗺️ Roadmap
-
-| Version    | Focus          | Highlights                                              |
-| ---------- | -------------- | ------------------------------------------------------- |
-| **v1.3.0** | Smart Features | Subtitle downloads, metadata editor, resolution presets |
-| **v1.4.0** | AI Tools       | Auto-tagging, title cleanup, smart trimming             |
 
 ---
 

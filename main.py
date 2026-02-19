@@ -8,11 +8,24 @@ import threading
 import tempfile
 import atexit
 import subprocess
+import webbrowser
+import pyperclip
 from datetime import datetime
 from pathlib import Path
 
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
+
+# Set Windows AppUserModelID early so the taskbar and "open apps" panel
+# show Clipster's icon instead of Python's.
+def _set_app_user_model_id():
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Clipster")
+    except Exception:
+        pass
+
+_set_app_user_model_id()
 
 _HISTORY_RW_LOCK = threading.RLock()
 
@@ -20,7 +33,7 @@ _HISTORY_RW_LOCK = threading.RLock()
 # Branding / Config
 # --------------------------------------------
 APP_NAME = "Clipster"
-APP_VERSION = "1.2.9"
+APP_VERSION = "1.3.0"
 ACCENT_COLOR = "#0078D7"
 SECONDARY_COLOR = "#00B7C2"
 SPLASH_TEXT = "Fetch. Download. Enjoy."
@@ -47,11 +60,16 @@ FFPLAY_EXE = ASSETS_DIR / "ffplay.exe"
 ALLOWED_FORMATS = ["mp4", "mkv", "webm", "m4a", "mp3"]
 
 YOUTUBE_URL_RE = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+", re.IGNORECASE)
+YOUTUBE_PLAYLIST_RE = re.compile(r"(youtube\.com|youtu\.be).*[?&]list=", re.IGNORECASE)
+#YOUTUBE_PLAYLIST_RE = re.compile(r"(https?://)?(www\.)?youtube\.com/.*[?&]list=", re.IGNORECASE)
 YT_DLP_PROGRESS_RE = re.compile(r"\[download\]\s+([\d\.]+)%")
 YT_DLP_SPEED_RE = re.compile(r"at\s+([0-9\.]+\w+/s)")
 YT_DLP_ETA_RE = re.compile(r"ETA\s+([0-9:]+)")
 
 LOG_FILE = BASE_DIR / "clipster.log"
+
+# Module-level app reference (set in __main__) used by log_debug
+_app = None
 
 # --------------------------------------------
 # Update check (GitHub latest release)
@@ -105,6 +123,11 @@ _SAFE_FILENAME_RE = re.compile(r'[^A-Za-z0-9 ._\-()]')
 
 
 
+def truncate_text(text, max_chars=80):
+    if not text:
+        return ""
+    text = str(text)
+    return text if len(text) <= max_chars else text[:max_chars-1] + "…"
 
 
 
@@ -139,9 +162,7 @@ def log_message(msg: str):
 
 def log_debug(msg):
     try:
-        settings = None
-        if 'app' in globals() and getattr(globals()['app'], 'settings', None):
-            settings = globals()['app'].settings
+        settings = getattr(_app, "settings", None)
         if settings and settings.get("debug_mode"):
             log_message("[DEBUG] " + msg)
     except Exception:
@@ -188,7 +209,7 @@ DEFAULT_SETTINGS = {
     "default_download_path": WINDOWS_DOWNLOADS_DIR,
     "cookies_path": "",
     "show_toasts": True,
-    "thumbnail_after_fetch": True
+    "max_concurrent_downloads": 1,
 }
 # -------------------------------------------------------------------------------
 
@@ -443,6 +464,14 @@ def show_toast(root, message, title=None, timeout=3000, level="info", theme="dar
 # ------------------ Windows Native Notification ------------------
 
 def windows_notify(title, message, open_path=None):
+    """Show a Windows 11 toast notification.
+
+    open_path: if given and exists, clicking the notification opens
+               that folder in Explorer. Uses win11toast's `launch`
+               parameter with a file:// URI — avoids the broken
+               on_click lambda behaviour that causes the
+               {'arguments': 'http:', 'user_input': {}} error.
+    """
     try:
         if not _is_windows():
             return
@@ -450,15 +479,21 @@ def windows_notify(title, message, open_path=None):
         from win11toast import toast
 
         kwargs = {
-            "title": title,
-            "body": message,
-            "duration": "short"
+            "title":    title,
+            "body":     message,
+            "duration": "short",
+            "app_id":   "Clipster.App.1.3",
         }
 
-        if open_path and os.path.exists(open_path):
-            kwargs["on_click"] = lambda *_: os.startfile(open_path)
+        # App icon in the notification badge
+        icon_path = ASSETS_DIR / "clipster.png"
+        if icon_path.exists():
+            kwargs["icon"] = {"src": str(icon_path), "placement": "appLogoOverride"}
 
-        _ = toast(**kwargs)
+        # Note: Click actions removed due to win11toast API changes
+        # Clicking the notification will bring the app to focus by default
+
+        toast(**kwargs)
 
     except Exception as e:
         log_message(f"windows_notify error: {e}")
@@ -492,7 +527,15 @@ def fetch_metadata_via_yt_dlp(url, timeout=30):
     """Fetch video metadata using yt-dlp; hides console window on Windows."""
     if not YT_DLP_EXE.exists():
         raise FileNotFoundError("yt-dlp.exe not found in Assets/")
-    cmd = [windows_quote(str(YT_DLP_EXE)), "--no-warnings", "--skip-download", "--dump-json", url]
+    cmd = [
+        YT_DLP_EXE,
+        "--no-warnings",
+        "--skip-download",
+        "--no-playlist",
+        "--dump-single-json",
+        "--no-check-certificates",
+        url
+    ]
     try:
         # Windows: hide window
         kwargs = {"capture_output": True, "text": True, "timeout": timeout}
@@ -536,25 +579,6 @@ class DownloadProcess:
     def __init__(self):
         self.proc = None
         self._lock = threading.Lock()
-        self.last_args = None
-        self.paused = False
-
-
-    def pause(self):
-        with self._lock:
-            if self.proc and self.proc.poll() is None:
-                try:
-                    self.proc.terminate()
-                    self.paused = True
-                except Exception:
-                    pass
-
-
-    def resume(self):
-        if self.paused and self.last_args:
-            self.paused = False
-            self.start_download(*self.last_args)
-
 
     def shutdown(self):
         with self._lock:
@@ -571,17 +595,6 @@ class DownloadProcess:
 
     def start_download(self, url, outdir, filename_template, format_selector, cookies_path=None, progress_callback=None, finished_callback=None, error_callback=None):
         """Start a download thread."""
-        self.last_args = (
-            url,
-            outdir,
-            filename_template,
-            format_selector,
-            cookies_path,
-            progress_callback,
-            finished_callback,
-            error_callback,
-        )
-        self.paused = False
         thread = threading.Thread(target=self._run_download, args=(url, outdir, filename_template, format_selector, cookies_path, progress_callback, finished_callback, error_callback), daemon=True)
         thread.start()
         return thread
@@ -592,13 +605,19 @@ class DownloadProcess:
             if error_callback: error_callback("yt-dlp.exe not found in Assets/")
             return
         outtmpl = os.path.join(outdir, filename_template)
-        cmd = [windows_quote(str(YT_DLP_EXE)), "--no-warnings", "--newline"]
+        cmd = [windows_quote(str(YT_DLP_EXE)), "--no-warnings", "--newline", "--continue"]
         if cookies_path:
             cmd += ["--cookies", windows_quote(cookies_path)]
         if format_selector == "__mp3__":
             cmd += ["-o", outtmpl, "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0", url]
         else:
-            cmd += ["-o", outtmpl, "-f", format_selector, url]
+            # Determine output format from the format selector string
+            if "webm" in format_selector:
+                cmd += ["-o", outtmpl, "-f", format_selector, "--merge-output-format", "webm", url]
+            elif "mkv" in format_selector or format_selector == "best":
+                cmd += ["-o", outtmpl, "-f", format_selector, "--merge-output-format", "mkv", url]
+            else:
+                cmd += ["-o", outtmpl, "-f", format_selector, url]
 
         try:
             popen_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT, "text": True, "bufsize": 1, "universal_newlines": True}
@@ -675,146 +694,6 @@ class DownloadProcess:
                 except Exception:
                     pass
 
-# --------------------------------------------
-# Thumbnail download & embed (ffmpeg)
-# --------------------------------------------
-def download_thumbnail(url, target_filename=None, timeout=20):
-    import requests, shutil
-    """Download thumbnail from URL. If target_filename is an absolute path,
-    save there directly. Otherwise save to the user's Downloads folder."""
-    try:
-        if target_filename and Path(target_filename).is_absolute():
-            target_path = str(target_filename)
-            Path(target_path).parent.mkdir(parents=True, exist_ok=True)
-        else:
-            downloads_path = str(Path.home() / "Downloads")
-            os.makedirs(downloads_path, exist_ok=True)
-            filename = target_filename if target_filename else f"clipster_thumb_{int(time.time())}.jpg"
-            target_path = os.path.join(downloads_path, filename)
-
-        r = requests.get(url, stream=True, timeout=timeout)
-        r.raise_for_status()
-        with open(target_path, "wb") as f:
-            shutil.copyfileobj(r.raw, f)
-
-        return target_path  # return saved file path
-    except Exception as e:
-        log_message(f"download_thumbnail error: {e}")
-        return None
-
-
-# ------------------ New helper: get_best_thumbnail_url ------------------
-def get_best_thumbnail_url(meta_or_url_or_vid):
-    """
-    Given meta dict, full url, or vid id - return a likely thumbnail URL.
-    Tries meta['thumbnail'] first, then YouTube standard endpoints.
-    """
-
-    from urllib.parse import urlparse, parse_qs
-
-    try:
-        if isinstance(meta_or_url_or_vid, dict):
-            t = meta_or_url_or_vid.get("thumbnail")
-            if t:
-                return t
-            url = meta_or_url_or_vid.get("webpage_url") or meta_or_url_or_vid.get("url") or ""
-        else:
-            url = str(meta_or_url_or_vid or "")
-        # attempt to extract video id
-        vid = None
-        if "watch?v=" in url or "youtu.be" in url or "youtube" in url:
-            vid = None
-            try:
-                parsed = urlparse(url)
-                if parsed.netloc and "youtu.be" in parsed.netloc:
-                    vid = parsed.path.lstrip("/")
-                else:
-                    qs = parse_qs(parsed.query)
-                    if "v" in qs:
-                        vid = qs["v"][0]
-            except Exception:
-                vid = None
-        if not vid:
-            # maybe passed a raw id
-            m = re.search(r"([A-Za-z0-9_-]{11})", url)
-            if m:
-                vid = m.group(1)
-        if vid:
-            # try high-quality variants in order
-            candidates = [
-                f"https://i.ytimg.com/vi/{vid}/maxresdefault.jpg",
-                f"https://i.ytimg.com/vi/{vid}/sddefault.jpg",
-                f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
-                f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg",
-            ]
-            return candidates[0]  # caller will attempt download & fallback to others if missing
-        return None
-    except Exception:
-        return None
-# ---------------------------------------------------------------------------------------
-
-
-def embed_thumbnail_with_ffmpeg(video_path, thumb_path):
-    """Embed thumbnail into video using ffmpeg in a safe atomic way."""
-
-
-    if not FFMPEG_EXE.exists():
-        return False
-    video_path = Path(video_path)
-    thumb_path = Path(thumb_path)
-    if not video_path.exists() or not thumb_path.exists():
-        return False
-    try:
-        with tempfile.NamedTemporaryFile(prefix="clipster_ffmpeg_", suffix=video_path.suffix, delete=False) as tmpf:
-            out_tmp = Path(tmpf.name)
-        cmd = [
-            windows_quote(str(FFMPEG_EXE)),
-            "-y",
-            "-i", str(video_path),
-            "-i", str(thumb_path),
-            "-map", "0",
-            "-map", "1",
-            "-c", "copy",
-            "-disposition:v:1", "attached_pic",
-            str(out_tmp)
-        ]
-        popen_kwargs = {"capture_output": True, "text": True}
-        if _is_windows():
-            si = subprocess.STARTUPINFO()
-            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            si.wShowWindow = subprocess.SW_HIDE
-            popen_kwargs["startupinfo"] = si
-            popen_kwargs["creationflags"] = 0x08000000
-        proc = subprocess.run(cmd, **popen_kwargs)
-        if proc.returncode != 0:
-            try:
-                out_tmp.unlink(missing_ok=True)
-            except Exception:
-                pass
-            log_message(f"FFmpeg embed failed: {proc.stderr}")
-            return False
-        # atomic replace
-        try:
-            backup = video_path.with_suffix(video_path.suffix + ".bak")
-            video_path.replace(backup)
-            out_tmp.replace(video_path)
-            backup.unlink(missing_ok=True)
-        except Exception:
-            try:
-                os.replace(str(out_tmp), str(video_path))
-            except Exception:
-                log_message("embed_thumbnail_with_ffmpeg: atomic replace failed")
-                return False
-        # cleanup thumb
-        try:
-            thumb_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-        return True
-    except Exception as e:
-        log_message(f"embed_thumbnail_with_ffmpeg exception: {e}")
-        return False
-# ---------------------------------------------------------------------------------------
 
 
 # --------------------------------------------
@@ -822,17 +701,27 @@ def embed_thumbnail_with_ffmpeg(video_path, thumb_path):
 # --------------------------------------------
 def build_format_selector_for_format_and_res(target_format, resolution_label):
     """Build yt-dlp format selector string based on format and resolution."""
-    if target_format == "mp4":
-        return "bestvideo[ext=mp4][height<=?1080]+bestaudio[ext=m4a]/best"
-    if target_format == "m4a":
-        return "bestaudio[ext=m4a]/bestaudio"
-    if target_format == "webm":
-        return "bestvideo[ext=webm]+bestaudio[ext=webm]/best"
-    if target_format == "mkv":
-        return "bestvideo[ext=mkv]+bestaudio/best"
+    height = resolution_to_height(resolution_label)
     if target_format == "mp3":
         return "__mp3__"
-    return "best"
+    if target_format == "m4a":
+        return "bestaudio[ext=m4a]/bestaudio"
+    if height:
+        if target_format == "mp4":
+            return f"bestvideo[ext=mp4][height<={height}]+bestaudio[ext=m4a]/best[height<={height}]"
+        if target_format == "webm":
+            return f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
+        if target_format == "mkv":
+            return f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
+        return f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
+    else:
+        if target_format == "mp4":
+            return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
+        if target_format == "webm":
+            return "bestvideo+bestaudio/best"
+        if target_format == "mkv":
+            return "bestvideo+bestaudio/best"
+        return "best"
 
 def resolution_to_height(res_label):
     """Map resolution label to height."""
@@ -845,6 +734,83 @@ def resolution_to_height(res_label):
     }
     return mapping.get(res_label, None)
 
+def parse_available_resolutions(formats_list, target_ext="mp4"):
+    """
+    Given the 'formats' list from yt-dlp JSON, return a list of resolution
+    labels that are actually available, sorted best-first.
+    Always includes 'Best Available'.
+    For audio-only formats (mp3/m4a) returns empty list.
+    """
+    if not formats_list:
+        return ["Best Available"]
+    seen = set()
+    for f in formats_list:
+        h = f.get("height")
+        vcodec = f.get("vcodec", "none")
+        if h and vcodec and vcodec != "none":
+            seen.add(h)
+    heights = sorted(seen, reverse=True)
+    heights = [h for h in heights if h >= 144]
+    labels = ["Best Available"] + [f"{h}p" for h in heights]
+    return labels if labels else ["Best Available"]
+
+
+def estimate_filesize_bytes(formats_list, target_format, resolution_label):
+    """
+    Estimate download size in bytes for a given format + resolution.
+    Sums best video stream + best audio stream sizes.
+    Returns None if no size info available.
+    """
+    if not formats_list:
+        return None
+    height = resolution_to_height(resolution_label)  # None = best
+    audio_only = target_format in ("mp3", "m4a")
+
+    # Best audio stream
+    audio_size = None
+    best_audio_abr = -1
+    for f in formats_list:
+        if f.get("vcodec", "none") in (None, "none") and f.get("acodec", "none") not in (None, "none"):
+            abr = f.get("abr") or 0
+            sz = f.get("filesize") or f.get("filesize_approx")
+            if sz and abr > best_audio_abr:
+                best_audio_abr = abr
+                audio_size = sz
+
+    if audio_only:
+        return audio_size
+
+    # Best video stream at/below requested height
+    video_size = None
+    best_h = -1
+    for f in formats_list:
+        vcodec = f.get("vcodec", "none")
+        if vcodec in (None, "none"):
+            continue
+        h = f.get("height") or 0
+        if height and h > height:
+            continue
+        sz = f.get("filesize") or f.get("filesize_approx")
+        if sz and h > best_h:
+            best_h = h
+            video_size = sz
+
+    if video_size and audio_size:
+        return video_size + audio_size
+    return video_size or audio_size or None
+
+
+def format_filesize(size_bytes):
+    """Human-readable file size string."""
+    if not size_bytes:
+        return "?"
+    if size_bytes < 1024 * 1024:
+        return f"~{size_bytes / 1024:.0f} KB"
+    if size_bytes < 1024 * 1024 * 1024:
+        return f"~{size_bytes / (1024*1024):.1f} MB"
+    return f"~{size_bytes / (1024*1024*1024):.2f} GB"
+
+
 def build_batch_format_selector(target_format, max_resolution_label):
     """Build format selector for batch/playlist downloads."""
     if target_format == "mp3":
@@ -854,10 +820,12 @@ def build_batch_format_selector(target_format, max_resolution_label):
         if target_format == "mp4":
             return f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={height}]"
         else:
+            # For webm, mkv, and others - use generic selector, --merge-output-format will enforce container
             return f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
     else:
         if target_format == "mp4":
             return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
+        # For webm, mkv, and others - use generic selector, --merge-output-format will enforce container
         return "bestvideo+bestaudio/best"
 
 # --------------------------------------------
@@ -866,96 +834,8 @@ def build_batch_format_selector(target_format, max_resolution_label):
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
-class SplashScreen(ctk.CTkToplevel):
-    def __init__(self, root):
-        super().__init__(root)
-
-        self.overrideredirect(True)
-        self.attributes("-topmost", True)
-        self.configure(fg_color="#121212")
-
-        width, height = 420, 260
-        x = (self.winfo_screenwidth() // 2) - (width // 2)
-        y = (self.winfo_screenheight() // 2) - (height // 2)
-        self.geometry(f"{width}x{height}+{x}+{y}")
-
-        container = ctk.CTkFrame(
-            self,
-            corner_radius=18,
-            fg_color="#1a1a1a"
-        )
-        container.pack(expand=True, fill="both", padx=8, pady=8)
-
-        # Logo
-        try:
-            Image = get_pil_image()
-            logo_path = ASSETS_DIR / "clipster.png"
-            if logo_path.exists():
-                img = Image.open(logo_path).convert("RGBA")
-                img.thumbnail((72, 72))
-                self.logo_img = ctk.CTkImage(img, size=(72, 72))
-                ctk.CTkLabel(container, image=self.logo_img, text="").pack(pady=(24, 10))
-        except Exception:
-            pass
-
-        # App name
-        ctk.CTkLabel(
-            container,
-            text=APP_NAME,
-            font=ctk.CTkFont(size=22, weight="bold")
-        ).pack()
-
-        # Tagline
-        ctk.CTkLabel(
-            container,
-            text=SPLASH_TEXT,
-            font=ctk.CTkFont(size=13),
-            text_color="#9aa0a6"
-        ).pack(pady=(2, 18))
-
-        # Spinner
-        self.progress = ctk.CTkProgressBar(
-            container,
-            mode="indeterminate",
-            height=6,
-            corner_radius=6
-        )
-        self.progress.pack(fill="x", padx=60)
-        self.progress.start()
-
-        # Fade-in
-        self.attributes("-alpha", 0.0)
-        self._fade_in()
-
-    def _fade_in(self, alpha=0.0):
-        if alpha < 1.0:
-            alpha += 0.08
-            self.attributes("-alpha", alpha)
-            self.after(15, lambda: self._fade_in(alpha))
-
-    # ✅ NEW: Fade-out animation
-    def fade_out_and_destroy(self, alpha=1.0):
-        if alpha > 0:
-            alpha -= 0.08
-            self.attributes("-alpha", alpha)
-            self.after(15, lambda: self.fade_out_and_destroy(alpha))
-        else:
-            self.progress.stop()
-            self.destroy()
-
-
-
 class ClipsterApp:
-
-    def pause_download(self):
-        self.download_proc.pause()
-        self.single_pause_btn.configure(text="Resume", command=self.resume_download)
-        _toast(self, "Download paused.", title="Paused")
-
-    def resume_download(self):
-        self.download_proc.resume()
-        self.single_pause_btn.configure(text="Pause", command=self.pause_download)
-        _toast(self, "Resuming download...", title="Resume")
+    """Main application class for Clipster GUI."""
 
     def get_executor(self):
         if self._executor is None:
@@ -968,7 +848,6 @@ class ClipsterApp:
             self.get_executor().submit(func, *args)
 
 
-    """Main application class for Clipster GUI."""
     def __init__(self, root):
         import concurrent.futures
         self.root = root
@@ -983,8 +862,17 @@ class ClipsterApp:
         self.root.geometry("1000x700")
         self.root.minsize(900, 600)
 
-        # Hide window initially to prevent flashing during setup
-        #self.root.withdraw()
+        # Set window icon — will be reinforced by _create_titlebar via WM_SETICON
+        try:
+            ico_path = ASSETS_DIR / "clipster.ico"
+            if ico_path.exists():
+                self.root.iconbitmap(default=str(ico_path))
+        except Exception:
+            pass
+
+        # Hide window initially to prevent flashing during setup and to ensure
+        # proper window style application before visibility
+        self.root.withdraw()
 
         ensure_directories()
         # Defer executable checks to after UI is shown to speed up initial render
@@ -1003,8 +891,6 @@ class ClipsterApp:
         self.current_task_cancelled = False
 
         # caches and mappings
-        self._history_thumb_imgs = {}
-        self._playlist_thumb_imgs = {}
         self._playlist_row_by_vid = {}
         self._playlist_row_order = []
 
@@ -1025,9 +911,7 @@ class ClipsterApp:
         self.tabs.pack(padx=12, pady=6, fill="both", expand=True)
 
         for name in (
-            "Single Video",
-            "Batch Downloader",
-            "Playlist Downloader",
+            "Download",
             "History",
             "Settings",
             "Update",
@@ -1116,13 +1000,11 @@ class ClipsterApp:
                 def disable_controls():
                     # single tab download buttons
                     try:
-                        self.single_download_btn.configure(state="disabled")
+                        try: self.dl_download_btn.configure(state="disabled")
+                        except Exception: pass
                     except Exception:
                         pass
-                    try:
-                        self.single_cancel_btn.configure(state="disabled")
-                    except Exception:
-                        pass
+                    pass  # cancel btn removed in v1.3.0
                     # ffplay preview
                     try:
                         # store missing set to check before preview
@@ -1139,124 +1021,164 @@ class ClipsterApp:
 
 
     def _show_window_after_setup(self):
-        """Show the window after initial setup to reduce flashing."""
+        """Show the window with a smooth fade-in after initial setup."""
+        self.root.attributes("-alpha", 0.0)
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
+        self.root.update_idletasks()
+        self._fade_in_window()
+
+    def _fade_in_window(self, alpha=0.0):
+        """Incrementally increase window opacity for a fade-in effect (~200ms)."""
+        alpha = min(alpha + 0.07, 1.0)
+        try:
+            self.root.attributes("-alpha", alpha)
+        except Exception:
+            return
+        if alpha < 1.0:
+            self.root.after(15, lambda: self._fade_in_window(alpha))
 
     def _create_titlebar(self):
-        """Create a custom titlebar with Windows 11 styling."""
+        """Create a modern custom titlebar with Windows 11 styling."""
         import ctypes
-        from ctypes import wintypes
-
-        # Hide native titlebar
+        
         hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-        GWL_STYLE = -16
-        WS_OVERLAPPEDWINDOW = 0x00CF0000
-        WS_VISIBLE = 0x10000000
-        WS_POPUP = 0x80000000
-
-        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
-        style = style & ~WS_OVERLAPPEDWINDOW | WS_POPUP | WS_VISIBLE
-        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, style)
-        ctypes.windll.user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, 0x0027)
-
-        # Add rounded corners
-        DWMWA_WINDOW_CORNER_PREFERENCE = 33
-        DWMWCP_ROUND = 2
+        
+        # ── Apply window styles early to ensure taskbar integration ───────────────
+        # This MUST happen before any UI setup and before the window becomes visible
         try:
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, ctypes.byref(ctypes.c_int(DWMWCP_ROUND)), ctypes.sizeof(ctypes.c_int)
-            )
+            self._set_window_styles()
+        except Exception as e:
+            log_message(f"Failed to apply window styles in titlebar setup: {e}")
+
+        # ── Set taskbar / Alt-Tab icon via WM_SETICON ─────────────────
+        # This must happen early; it tells Windows which icon to show in the taskbar, 
+        # the Alt+Tab switcher, and the window's own system menu.
+        ico_path = ASSETS_DIR / "clipster.ico"
+        try:
+            if ico_path.exists():
+                # Load as HICON (LR_LOADFROMFILE = 0x10, IMAGE_ICON = 1)
+                ICON_SMALL = 0
+                ICON_BIG   = 1
+                WM_SETICON = 0x0080
+                hicon_big = ctypes.windll.user32.LoadImageW(
+                    None, str(ico_path), 1, 0, 0, 0x10
+                )
+                hicon_small = ctypes.windll.user32.LoadImageW(
+                    None, str(ico_path), 1, 16, 16, 0x10
+                )
+                if hicon_big:
+                    ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, hicon_big)
+                if hicon_small:
+                    ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, hicon_small)
         except Exception:
             pass
 
-        # Build custom titlebar frame
-        self.titlebar_frame = ctk.CTkFrame(self.root, height=32, corner_radius=0)
-        self.titlebar_frame.pack(fill="x", side="top")
-
-        self._update_titlebar_theme()
-
-        # Left: icon + title
-        left = ctk.CTkFrame(self.titlebar_frame, fg_color="transparent")
-        left.pack(side="left", padx=(8, 4), pady=2)
-
-        icon_img = None
-        ico_path = BASE_DIR / "Assets" / "clipster.ico"
-
-        # Set icon immediately without PIL
+        # Also keep Tkinter's own reference so it doesn't get GC'd
         try:
             if ico_path.exists():
                 self.root.iconbitmap(default=str(ico_path))
         except Exception:
             pass
 
-        # Defer PNG thumbnail creation
+        # Re-affirm AppUserModelID now that we have an HWND, ensuring the
+        # taskbar groups this window under Clipster (not python.exe)
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Clipster.App.1.3")
+        except Exception:
+            pass
+
+        # Rounded corners (Windows 11)
+        try:
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, 33, ctypes.byref(ctypes.c_int(2)), ctypes.sizeof(ctypes.c_int)
+            )
+        except Exception:
+            pass
+
+        # Titlebar frame — taller for breathing room
+        self.titlebar_frame = ctk.CTkFrame(self.root, height=38, corner_radius=0)
+        self.titlebar_frame.pack(fill="x", side="top")
+        self.titlebar_frame.pack_propagate(False)
+        self._update_titlebar_theme()
+
+        # ── Left: icon + app name + version badge ──────────────────────
+        left = ctk.CTkFrame(self.titlebar_frame, fg_color="transparent")
+        left.pack(side="left", padx=(10, 4), pady=4)
+
+        icon_lbl = ctk.CTkLabel(left, text="▶", font=ctk.CTkFont(size=14), width=20)
+        icon_lbl.pack(side="left")
+
         def load_titlebar_icon():
             try:
                 png_path = BASE_DIR / "Assets" / "clipster.png"
                 if png_path.exists():
-                    Image = get_pil_image()
-                    img = Image.open(png_path).convert("RGBA")
-                    img.thumbnail((20, 20))
-                    icon_img = ctk.CTkImage(img, size=(20, 20))
-                    icon_lbl.configure(image=icon_img)
-                    icon_lbl.image = icon_img
+                    img = get_pil_image().open(png_path).convert("RGBA")
+                    img.thumbnail((22, 22))
+                    ctkimg = ctk.CTkImage(img, size=(22, 22))
+                    icon_lbl.configure(image=ctkimg, text="")
+                    icon_lbl.image = ctkimg
             except Exception:
                 pass
-
-        # Create placeholder first
-        icon_lbl = ctk.CTkLabel(left, text="▶", font=ctk.CTkFont(size=13))
-        icon_lbl.pack(side="left", pady=1)
-
-        # Load actual icon after 200ms
         self.root.after(200, load_titlebar_icon)
 
-        if icon_img:
-            icon_lbl = ctk.CTkLabel(left, image=icon_img, text="")
-            icon_lbl.image = icon_img
-            icon_lbl.pack(side="left", pady=1)
-        else:
-            icon_lbl = ctk.CTkLabel(left, text="▶", font=ctk.CTkFont(size=13))
-            icon_lbl.pack(side="left")
+        self._title_lbl = ctk.CTkLabel(
+            left, text=APP_NAME,
+            font=ctk.CTkFont(size=13, weight="bold")
+        )
+        self._title_lbl.pack(side="left", padx=(8, 4))
 
-        self._title_lbl = ctk.CTkLabel(left, text=APP_NAME, font=ctk.CTkFont(size=12, weight="bold"))
-        self._title_lbl.pack(side="left", padx=(6, 2))
-        self._subtitle_lbl = ctk.CTkLabel(left, text=SPLASH_TEXT, font=ctk.CTkFont(size=10))
+        # Version badge
+        self._version_badge = ctk.CTkLabel(
+            left, text=f"v{APP_VERSION}",
+            font=ctk.CTkFont(size=10),
+            fg_color=ACCENT_COLOR, corner_radius=4,
+            width=42, height=18, text_color="white"
+        )
+        self._version_badge.pack(side="left", padx=(0, 8))
+
+        self._subtitle_lbl = ctk.CTkLabel(
+            left, text=SPLASH_TEXT,
+            font=ctk.CTkFont(size=10), text_color="#888888"
+        )
         self._subtitle_lbl.pack(side="left")
 
-        # Center drag zone
-        drag_zone = ctk.CTkFrame(self.titlebar_frame, fg_color="transparent", height=1)
+        # ── Center drag zone ───────────────────────────────────────────
+        drag_zone = ctk.CTkFrame(self.titlebar_frame, fg_color="transparent")
         drag_zone.pack(side="left", fill="both", expand=True)
 
-        for w in (drag_zone, self._title_lbl, self._subtitle_lbl, icon_lbl):
+        for w in (drag_zone, self._title_lbl, self._subtitle_lbl, icon_lbl, self._version_badge):
             w.bind("<ButtonPress-1>", self._begin_native_drag)
             w.bind("<Double-Button-1>", lambda e: self._toggle_max_restore())
 
-        # Right buttons
+        # ── Right: window controls ─────────────────────────────────────
         btns = ctk.CTkFrame(self.titlebar_frame, fg_color="transparent")
-        btns.pack(side="right", padx=2, pady=2)
+        btns.pack(side="right", pady=4, padx=(0, 6))
 
         self._min_btn = ctk.CTkButton(
-            btns, text="🗕", width=26, height=24, corner_radius=4,
-            fg_color="transparent", hover_color="#2D2D2D",
+            btns, text="—", width=32, height=28, corner_radius=6,
+            fg_color="transparent", hover_color="#3A3A3A",
+            font=ctk.CTkFont(size=12),
             command=self._minimize_window
         )
-        self._min_btn.pack(side="left", padx=(2, 0))
+        self._min_btn.pack(side="left", padx=2)
 
         self._max_btn = ctk.CTkButton(
-            btns, text="🗖", width=26, height=24, corner_radius=4,
-            fg_color="transparent", hover_color="#2D2D2D",
+            btns, text="□", width=32, height=28, corner_radius=6,
+            fg_color="transparent", hover_color="#3A3A3A",
+            font=ctk.CTkFont(size=12),
             command=self._toggle_max_restore
         )
-        self._max_btn.pack(side="left", padx=1)
+        self._max_btn.pack(side="left", padx=2)
 
         self._close_btn = ctk.CTkButton(
-            btns, text="✕", width=26, height=24, corner_radius=4,
-            fg_color="transparent", hover_color="tomato",
+            btns, text="✕", width=32, height=28, corner_radius=6,
+            fg_color="transparent", hover_color="#C42B1C",
+            font=ctk.CTkFont(size=12),
             command=self._close_window
         )
-        self._close_btn.pack(side="left", padx=(1, 4))
+        self._close_btn.pack(side="left", padx=2)
 
         self._is_maximized = False
 
@@ -1281,6 +1203,53 @@ class ClipsterApp:
         except Exception as e:
             log_message(f"[Mica] Warning: could not enable Mica effect: {e}")
 
+    def _set_window_styles(self):
+        """Set window styles to remove native titlebar but keep taskbar presence."""
+        import ctypes
+
+        hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+
+        # ── Strip native titlebar chrome ──────────────────────────────
+        # Keep WS_OVERLAPPED (0x00000000 base) + WS_VISIBLE (0x10000000)
+        # + WS_THICKFRAME (0x00040000) for resize + WS_SYSMENU (0x00080000)
+        # WS_SYSMENU is required so Windows keeps the taskbar button.
+        # Remove WS_CAPTION (0x00C00000) and WS_MINIMIZEBOX/MAXIMIZEBOX
+        # so the native titlebar and its buttons disappear, but the taskbar
+        # entry and icon remain.
+        GWL_STYLE    = -16
+        GWL_EXSTYLE  = -20
+        WS_CAPTION      = 0x00C00000
+        WS_BORDER       = 0x00800000
+        WS_DLGFRAME     = 0x00400000
+        WS_SYSMENU      = 0x00080000   # must keep — owns the taskbar button
+        WS_THICKFRAME   = 0x00040000   # keep — allows resize
+        WS_VISIBLE      = 0x10000000
+
+        # Extended style: ensure WS_EX_APPWINDOW (0x00040000) is SET and
+        # WS_EX_TOOLWINDOW (0x00000080) is CLEAR so the app appears in the
+        # taskbar and Alt+Tab switcher.
+        WS_EX_APPWINDOW  = 0x00040000
+        WS_EX_TOOLWINDOW = 0x00000080
+
+        style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_STYLE)
+        # Clear caption/border bits, keep sysmenu + thickframe + visible
+        style = (style & ~(WS_CAPTION | WS_BORDER | WS_DLGFRAME)) | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE
+        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_STYLE, style)
+
+        exstyle = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        exstyle = (exstyle & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW
+        ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, exstyle)
+
+        # Apply the style change without moving/sizing the window
+        SWP_NOMOVE    = 0x0002
+        SWP_NOSIZE    = 0x0001
+        SWP_NOZORDER  = 0x0004
+        SWP_FRAMECHANGED = 0x0020
+        ctypes.windll.user32.SetWindowPos(
+            hwnd, None, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED
+        )
+
     def _begin_native_drag(self, event):
         """Start native window drag using Windows API."""
         import ctypes
@@ -1300,11 +1269,11 @@ class ClipsterApp:
             self._prev_geom = self.root.geometry()
             ctypes.windll.user32.ShowWindow(hwnd, 3)  # SW_MAXIMIZE
             self._is_maximized = True
-            self._max_btn.configure(text="🗗")
+            self._max_btn.configure(text="⧈")
         else:
             ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
             self._is_maximized = False
-            self._max_btn.configure(text="🗖")
+            self._max_btn.configure(text="□")
         self._animate_window("show")
 
     def _minimize_window(self):
@@ -1313,15 +1282,28 @@ class ClipsterApp:
         self.root.iconify()
 
     def _close_window(self):
+        """Close the window with a smooth fade-out effect (~150ms)."""
+        self._fade_out_and_close()
+
+    def _fade_out_and_close(self, alpha=1.0):
+        """Incrementally decrease window opacity then destroy."""
+        alpha = max(alpha - 0.1, 0.0)
         try:
-            self.graceful_shutdown()
+            self.root.attributes("-alpha", alpha)
         except Exception:
             pass
-        try:
-            self.root.quit()
-            self.root.destroy()
-        except Exception:
-            pass
+        if alpha > 0.0:
+            self.root.after(15, lambda: self._fade_out_and_close(alpha))
+        else:
+            try:
+                self.graceful_shutdown()
+            except Exception:
+                pass
+            try:
+                self.root.quit()
+                self.root.destroy()
+            except Exception:
+                pass
 
     def graceful_shutdown(self):
         """Safely shut down downloads, background workers, and temp files."""
@@ -1381,45 +1363,10 @@ class ClipsterApp:
         except Exception:
             pass
 
-    def _safe_create_ctkimage(self, img_path, size):
-        """Safely create CTkImage from path."""
-        try:
-            Image = get_pil_image()
-            img = Image.open(img_path).convert("RGBA")
-            img.thumbnail(size)
-            ctkimg = ctk.CTkImage(img, size=size)
-            return ctkimg
-        except Exception as e:
-            log_message(f"_safe_create_ctkimage error for {img_path}: {e}")
-            return None
-
+    
     def _path_exists(self, p):
         return Path(str(p)).exists() if p else False
 
-    def _set_label_image_from_path(self, label, path, size=(160, 90), fallback_text="No thumbnail"):
-        """Set CTkLabel image from path."""
-        try:
-            if not path or not Path(str(path)).exists():
-                label.configure(text=fallback_text, image=None)
-                label.image = None
-                return False
-            ctkimg = self._safe_create_ctkimage(str(path), size)
-            if ctkimg:
-                label.configure(image=ctkimg, text="")
-                label.image = ctkimg
-                return True
-            else:
-                label.configure(text="Thumb error", image=None)
-                label.image = None
-                return False
-        except Exception:
-            try:
-                label.configure(text="Thumb error", image=None)
-                label.image = None
-            except Exception:
-                pass
-            return False
-        
     def _apply_theme(self):
         """Apply theme to the application. (override to recreate drag ghost to avoid desync)"""
         ctk.set_appearance_mode(self.settings.get("theme", "dark"))
@@ -1427,18 +1374,18 @@ class ClipsterApp:
             self.root.configure(fg_color=ctk.ThemeManager.theme["CTkFrame"]["fg_color"])
         except Exception:
             pass
-        if not self._history_loaded:
+        if self._history_loaded:
+            self.refresh_history()
+        else:
             self.root.after(300, self.load_and_render_history)
         self._update_titlebar_theme()
         self._enable_mica_effect()
         self.root.update_idletasks()
 
     def _on_theme_combo_changed(self, choice):
-        """Called when the user picks a new theme from the combo box."""
-        self.settings["theme"] = choice
-        ctk.set_appearance_mode(choice)      # instant switch
-        self._apply_theme()                  # update title-bar, Mica, etc.
-        _toast(self, f"Theme changed to {choice}.", title="Theme")
+        """Called when the user picks a new theme from the combo box — preview only, not saved."""
+        # Do NOT apply or save — theme will be applied only when "Apply Settings" is clicked.
+        pass
 
 
     def _update_titlebar_theme(self):
@@ -1594,9 +1541,7 @@ class ClipsterApp:
     def _build_ui(self):
         """Populate tab contents (called after skeleton UI is visible)."""
         try:
-            self._build_single_tab(self.tabs.tab("Single Video"))
-            self._build_batch_tab(self.tabs.tab("Batch Downloader"))
-            self._build_playlist_tab(self.tabs.tab("Playlist Downloader"))
+            self._build_download_tab(self.tabs.tab("Download"))
             self._build_history_tab(self.tabs.tab("History"))
             self._build_settings_tab(self.tabs.tab("Settings"))
             self._build_update_tab(self.tabs.tab("Update"))
@@ -1608,179 +1553,712 @@ class ClipsterApp:
         except Exception as e:
             log_message(f"_build_ui error: {e}")
 
-    def _build_single_tab(self, parent):
-        """Build UI for Single Video tab."""
+    def _build_download_tab(self, parent):
+        """Build the queue-based Download tab."""
+        self._dl_queue = []
+        self._dl_queue_lock = threading.Lock()
+
         pad = 12
         frame = ctk.CTkFrame(parent, corner_radius=12)
         frame.pack(fill="both", expand=True, padx=pad, pady=pad)
-        left = ctk.CTkFrame(frame, corner_radius=10)
-        left.pack(side="left", fill="y", padx=(0, 8), pady=4)
 
-        url_frame = ctk.CTkFrame(left, fg_color="transparent")
-        url_frame.pack(fill="x", padx=8, pady=(8, 4))
-        ctk.CTkLabel(url_frame, text="Video URL:", anchor="w", width=100).pack(side="left", padx=(0, 8))
-        self.single_url_entry = ctk.CTkEntry(url_frame, width=400, height=36, corner_radius=8)
-        self.single_url_entry.pack(side="left", fill="x", expand=True)
-
-        self.fetch_meta_btn = ctk.CTkButton(left, text="Fetch Metadata", fg_color=ACCENT_COLOR, 
-                                     height=36, corner_radius=8, command=self.on_fetch_single_metadata)
-        self.fetch_meta_btn.pack(padx=8, pady=6)
-
-        self.save_thumb_btn = ctk.CTkButton(left, text="Save Thumbnail", fg_color="gray", 
-                                            height=36, corner_radius=8, command=self.on_save_thumbnail)
-        self.save_thumb_btn.pack(padx=8, pady=(0,6))
-        self.save_thumb_btn.configure(state="disabled")
-
-        res_frame = ctk.CTkFrame(left, fg_color="transparent")
-        res_frame.pack(fill="x", padx=8, pady=(8, 4))
-        ctk.CTkLabel(res_frame, text="Resolution:", anchor="w", width=100).pack(side="left", padx=(0, 8))
-        self.single_resolution_combo = ctk.CTkComboBox(res_frame, values=["Best Available"], width=250, 
-                                                        height=36, corner_radius=8)
-        self.single_resolution_combo.set("Best Available")
-        self.single_resolution_combo.pack(side="left")
-
-        fmt_frame = ctk.CTkFrame(left, fg_color="transparent")
-        fmt_frame.pack(fill="x", padx=8, pady=(8, 4))
-        ctk.CTkLabel(fmt_frame, text="Format:", anchor="w", width=100).pack(side="left", padx=(0, 8))
-        self.single_format_combo = ctk.CTkComboBox(fmt_frame, values=ALLOWED_FORMATS, width=250, 
-                                                    height=36, corner_radius=8,
-                                                    command=self._on_single_format_changed)
-        self.single_format_combo.set(self.settings.get("default_format", "mp4"))
-        self.single_format_combo.pack(side="left")
-        # Apply initial state in case saved default is mp3
-        self._on_single_format_changed(self.single_format_combo.get())
-
-        
-
-        btn_frame = ctk.CTkFrame(left, fg_color="transparent")
-        btn_frame.pack(padx=8, pady=(4, 12))
-        self.single_download_btn = ctk.CTkButton(btn_frame, text="Download", fg_color=ACCENT_COLOR, height=36, corner_radius=8, command=self.on_single_download)
-        self.single_download_btn.pack(side="left", padx=6)
-        self.single_cancel_btn = ctk.CTkButton(btn_frame, text="Cancel", height=36, corner_radius=8, command=self.cancel_download)
-        self.single_cancel_btn.pack(side="left", padx=6)
-
-        
-
-        self.single_pause_btn = ctk.CTkButton(
-            btn_frame,
-            text="Pause",
-            height=36,
-            corner_radius=8,
-            command=self.pause_download
+        # ── URL input row ──────────────────────────────────────────────
+        url_bar = ctk.CTkFrame(frame, fg_color="transparent")
+        url_bar.pack(fill="x", padx=8, pady=(10, 4))
+        self.dl_url_entry = ctk.CTkEntry(
+            url_bar, placeholder_text="Paste a YouTube URL and press Enter or click Add",
+            height=38, corner_radius=8
         )
-        self.single_pause_btn.pack(side="left", padx=6)
-        self.single_pause_btn.configure(state="disabled")
+        self.dl_url_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.dl_url_entry.bind("<Return>", lambda e: self._dl_add_url())
+        ctk.CTkButton(
+            url_bar, text="Add", fg_color=ACCENT_COLOR,
+            width=80, height=38, corner_radius=8,
+            command=self._dl_add_url
+        ).pack(side="left")
 
-        ctk.CTkLabel(left, text="Progress:", anchor="w").pack(padx=8, pady=(6, 0))
-        self.single_progress = ctk.CTkProgressBar(left, width=320, height=8, corner_radius=4)
-        self.single_progress.set(0)
-        self.single_progress.pack(padx=8, pady=(4, 8))
-        self.single_progress_label = ctk.CTkLabel(left, text="")
-        self.single_progress_label.pack(padx=8, pady=(2, 8))
+        # ── Queue list ─────────────────────────────────────────────────
+        ctk.CTkLabel(frame, text="Download Queue:", anchor="w",
+                     font=ctk.CTkFont(size=12)).pack(anchor="w", padx=10, pady=(6, 2))
+        self.dl_queue_scroll = ctk.CTkScrollableFrame(frame, corner_radius=10)
+        self.dl_queue_scroll.pack(fill="both", expand=True, padx=8, pady=(0, 4))
 
-        right = ctk.CTkFrame(frame, corner_radius=10)
-        right.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=4)
-
-        self.meta_title_var = ctk.StringVar(value="")
-        self.meta_title_label = ctk.CTkLabel(
-            right,
-            textvariable=self.meta_title_var,
-            font=ctk.CTkFont(size=16, weight="bold"),
-            wraplength=420,  # adjust width limit
-            justify="left",
-            anchor="nw"
+        self._dl_empty_label = ctk.CTkLabel(
+            self.dl_queue_scroll,
+            text="No videos added yet. Paste a URL above to get started.",
+            text_color="#888888", font=ctk.CTkFont(size=12)
         )
-        self.meta_title_label.pack(anchor="nw", padx=8, pady=(8, 0), fill="x")
+        self._dl_empty_label.pack(pady=40)
 
-        self.meta_uploader_var = ctk.StringVar(value="")
-        ctk.CTkLabel(right, textvariable=self.meta_uploader_var, font=ctk.CTkFont(size=12)).pack(anchor="nw", padx=8, pady=2)
-        self.meta_duration_var = ctk.StringVar(value="")
-        ctk.CTkLabel(right, textvariable=self.meta_duration_var, font=ctk.CTkFont(size=12)).pack(anchor="nw", padx=8, pady=2)
+        # ── Overall summary bar ────────────────────────────────────────
+        summary = ctk.CTkFrame(frame, corner_radius=10)
+        summary.pack(fill="x", padx=8, pady=(2, 4))
+        summary.grid_columnconfigure(1, weight=1)
 
-        self.thumbnail_label = ctk.CTkLabel(right, text="Thumbnail preview", width=320, height=180, anchor="center", corner_radius=10)
-        self.thumbnail_label.pack(anchor="nw", padx=8, pady=12)
+        self.dl_overall_progress = ctk.CTkProgressBar(
+            summary, height=8, corner_radius=4,
+            fg_color="#2E2E2E", progress_color=ACCENT_COLOR
+        )
+        self.dl_overall_progress.set(0)
+        self.dl_overall_progress.grid(row=0, column=0, columnspan=3, sticky="ew",
+                                      padx=10, pady=(8, 4))
 
-    def on_save_thumbnail(self):
-        import shutil
-        """Save the last fetched thumbnail safely to the configured download folder."""
+        self.dl_summary_lbl = ctk.CTkLabel(
+            summary, text="No videos queued",
+            font=ctk.CTkFont(size=11), text_color="#888888", anchor="w"
+        )
+        self.dl_summary_lbl.grid(row=1, column=0, sticky="w", padx=(10, 0), pady=(0, 6))
+
+        self.dl_speed_lbl = ctk.CTkLabel(
+            summary, text="",
+            font=ctk.CTkFont(size=11), text_color="#aaaaaa", anchor="e"
+        )
+        self.dl_speed_lbl.grid(row=1, column=2, sticky="e", padx=(0, 10), pady=(0, 6))
+
+        # ── Bottom controls row ────────────────────────────────────────
+        ctrl = ctk.CTkFrame(frame, corner_radius=10)
+        ctrl.pack(fill="x", padx=8, pady=(0, 8))
+
+        ctk.CTkButton(
+            ctrl, text="Clear All", fg_color="gray",
+            width=90, height=34, corner_radius=8,
+            command=self._dl_clear_all
+        ).pack(side="right", padx=(4, 10))
+        self.dl_download_btn = ctk.CTkButton(
+            ctrl, text="⏬  Download All", fg_color=ACCENT_COLOR,
+            width=140, height=34, corner_radius=8,
+            command=self._dl_start_all
+        )
+        self.dl_download_btn.pack(side="right", padx=4)
+
+
+    # ──────────────────────────────────────────────────────────────
+    # Download Queue Methods
+    # ──────────────────────────────────────────────────────────────
+
+    def _dl_add_url(self):
+        url = self.dl_url_entry.get().strip()
+        if not url:
+            return
+
+        if YOUTUBE_PLAYLIST_RE.match(url):
+            # Show inline playlist panel in the Download tab
+            self.dl_url_entry.delete(0, "end")
+            self._dl_show_playlist_panel(url)
+            return
+
+        if not YOUTUBE_URL_RE.match(url):
+            _toast(self, "Not a valid YouTube URL.", level="error")
+            return
+
+        self.dl_url_entry.delete(0, "end")
+
+        default_fmt = self.settings.get("default_format", "mp4")
+
+        entry = {
+            "url":    url,
+            "title":  url,
+            "uploader": "",
+            "duration": "",
+            "status": "fetching",
+            "row":    None,
+            "available_resolutions": ["Best Available"],
+            "selected_res": "Best Available",
+            "selected_fmt": default_fmt,
+            "fmt_selector": build_format_selector_for_format_and_res(default_fmt, "Best Available"),
+            "filesize_bytes": None,
+            "formats_raw":    [],
+            # widget refs for in-place updates (no full re-render during download)
+            "_status_lbl":   None,
+            "_progress_bar": None,
+            "_speed_lbl":    None,
+            "_size_lbl":     None,
+        }
+
+        with self._dl_queue_lock:
+            idx = len(self._dl_queue)
+            self._dl_queue.append(entry)
+
+        self._dl_render_queue()
+        self._dl_update_summary()
+        self._dl_start_fetch_animation()
+
+        def fetch_task(queue_idx, e):
+            try:
+                meta = fetch_metadata_via_yt_dlp(e["url"])
+                e["title"]       = meta.get("title", e["url"])
+                e["uploader"]    = meta.get("uploader", "")
+                e["duration"]    = meta.get("duration_string", "")
+                e["formats_raw"] = meta.get("formats", [])
+                e["available_resolutions"] = parse_available_resolutions(e["formats_raw"])
+                if e["selected_res"] not in e["available_resolutions"]:
+                    e["selected_res"] = "Best Available"
+                e["filesize_bytes"] = estimate_filesize_bytes(
+                    e["formats_raw"], e["selected_fmt"], e["selected_res"]
+                )
+                e["fmt_selector"] = build_format_selector_for_format_and_res(
+                    e["selected_fmt"], e["selected_res"]
+                )
+                self.ui_queue.put(("dl_meta_ready", queue_idx))
+            except Exception as ex:
+                self.ui_queue.put(("dl_item_status", queue_idx, "error", str(ex)))
+
+        threading.Thread(target=fetch_task, args=(idx, entry), daemon=True).start()
+
+    # ──────────────────────────────────────────────────────────────
+    # Inline Playlist Panel (shown inside Download tab)
+    # ──────────────────────────────────────────────────────────────
+
+    def _dl_show_playlist_panel(self, url):
+        """Show an inline playlist fetcher panel inside the Download tab queue area."""
+        # Clear previous panel if any
+        self._dl_dismiss_playlist_panel()
+
+        self._pl_panel = ctk.CTkFrame(self.dl_queue_scroll, corner_radius=10)
+        self._pl_panel.pack(fill="x", padx=4, pady=(4, 8))
+
+        # Header row
+        hdr = ctk.CTkFrame(self._pl_panel, fg_color="transparent")
+        hdr.pack(fill="x", padx=8, pady=(8, 4))
+        ctk.CTkLabel(hdr, text="📋 Playlist Downloader", font=ctk.CTkFont(size=13, weight="bold"), anchor="w").pack(side="left")
+        ctk.CTkButton(hdr, text="✕ Close", fg_color="gray", width=80, height=28, corner_radius=6,
+                      command=self._dl_dismiss_playlist_panel).pack(side="right")
+
+        # URL display
+        url_row = ctk.CTkFrame(self._pl_panel, fg_color="transparent")
+        url_row.pack(fill="x", padx=8, pady=(0, 4))
+        self._pl_url_entry = ctk.CTkEntry(url_row, height=34, corner_radius=8)
+        self._pl_url_entry.insert(0, url)
+        self._pl_url_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ctk.CTkButton(url_row, text="Fetch Items", fg_color=ACCENT_COLOR, height=34, corner_radius=8,
+                      width=110, command=self._pl_fetch_items).pack(side="left")
+
+        # Progress label
+        self._pl_status_lbl = ctk.CTkLabel(self._pl_panel, text="", anchor="w", font=ctk.CTkFont(size=11))
+        self._pl_status_lbl.pack(anchor="w", padx=10, pady=(2, 0))
+
+        # Scrollable video list
+        self._pl_items_frame = ctk.CTkScrollableFrame(self._pl_panel, height=200, corner_radius=8)
+        self._pl_items_frame.pack(fill="both", expand=True, padx=8, pady=(4, 6))
+
+        # Bottom controls
+        bottom = ctk.CTkFrame(self._pl_panel, fg_color="transparent")
+        bottom.pack(fill="x", padx=8, pady=(0, 8))
+        ctk.CTkLabel(bottom, text="Format:").pack(side="left", padx=(0, 4))
+        self._pl_format_combo = ctk.CTkComboBox(bottom, values=ALLOWED_FORMATS, width=100, height=32, corner_radius=8)
+        self._pl_format_combo.set(self.settings.get("default_format", "mp4"))
+        self._pl_format_combo.pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(bottom, text="Max Res:").pack(side="left", padx=(0, 4))
+        self._pl_res_combo = ctk.CTkComboBox(bottom, values=["Best Available", "1080p", "720p", "480p"], width=130, height=32, corner_radius=8)
+        self._pl_res_combo.set("Best Available")
+        self._pl_res_combo.pack(side="left", padx=(0, 10))
+        ctk.CTkButton(bottom, text="Select All", fg_color="gray", width=90, height=32, corner_radius=8,
+                      command=self._pl_select_all).pack(side="left", padx=4)
+        ctk.CTkButton(bottom, text="Deselect All", fg_color="gray", width=90, height=32, corner_radius=8,
+                      command=self._pl_deselect_all).pack(side="left", padx=4)
+        ctk.CTkButton(bottom, text="⏬ Add to Queue", fg_color=ACCENT_COLOR, width=130, height=32, corner_radius=8,
+                      command=self._pl_add_selected_to_queue).pack(side="right", padx=4)
+
+        self._pl_rows = []  # list of (BoolVar, entry_dict)
+        self._pl_empty_lbl = ctk.CTkLabel(self._pl_items_frame, text="Press 'Fetch Items' to load playlist videos.",
+                                          text_color="#888888", font=ctk.CTkFont(size=12))
+        self._pl_empty_lbl.pack(pady=20)
+
+        # Kick off fetch automatically
+        self.root.after(100, self._pl_fetch_items)
+
+    def _dl_dismiss_playlist_panel(self):
+        """Remove the inline playlist panel if it exists."""
+        panel = getattr(self, "_pl_panel", None)
+        if panel:
+            try:
+                panel.destroy()
+            except Exception:
+                pass
+            self._pl_panel = None
+            self._pl_rows = []
+
+    def _pl_fetch_items(self):
+        """Fetch playlist items and populate the inline panel."""
+        url = getattr(self, "_pl_url_entry", None)
+        if not url:
+            return
+        url = self._pl_url_entry.get().strip()
+        if not url:
+            return
+
+        # Clear existing rows
+        self._pl_rows = []
+        for w in self._pl_items_frame.winfo_children():
+            try:
+                w.destroy()
+            except Exception:
+                pass
+
+        self._pl_status_lbl.configure(text="⏳ Fetching playlist items...")
+
+        def task():
+            try:
+                cmd = [
+                    windows_quote(str(YT_DLP_EXE)),
+                    "--no-warnings", "--flat-playlist", "--dump-json", url
+                ]
+                result = run_subprocess_safe(cmd, timeout=60)
+                if result["timed_out"]:
+                    raise RuntimeError("yt-dlp playlist fetch timed out.")
+                if result["returncode"] != 0:
+                    raise RuntimeError(result["stderr"] or "yt-dlp returned error")
+                lines = [l for l in result["stdout"].splitlines() if l.strip()]
+                seen_ids = set()
+                items = []
+                for line in lines:
+                    try:
+                        data = json.loads(line)
+                        vid_id = data.get("id") or data.get("url")
+                        if not vid_id or vid_id in seen_ids:
+                            continue
+                        seen_ids.add(vid_id)
+                        title = data.get("title") or "<No title>"
+                        full_url = f"https://youtube.com/watch?v={vid_id}"
+                        items.append({"title": title, "url": full_url, "id": vid_id})
+                    except Exception:
+                        continue
+                self.ui_queue.put(("pl_inline_items_ready", items))
+            except Exception as e:
+                self.ui_queue.put(("pl_inline_error", str(e)))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def _pl_render_items(self, items):
+        """Render fetched playlist items into the inline panel."""
+        # Clear
+        for w in self._pl_items_frame.winfo_children():
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        self._pl_rows = []
+
+        if not items:
+            ctk.CTkLabel(self._pl_items_frame, text="No items found in this playlist.",
+                         text_color="#888888").pack(pady=20)
+            return
+
+        for i, entry in enumerate(items):
+            var = ctk.BooleanVar(value=True)
+            row = ctk.CTkFrame(self._pl_items_frame, fg_color="transparent", height=32)
+            row.pack(fill="x", padx=4, pady=2)
+            chk = ctk.CTkCheckBox(row, text="", variable=var, width=28)
+            chk.pack(side="left", padx=(4, 6))
+            lbl = ctk.CTkLabel(row, text=f"{i+1}. {entry['title']}", anchor="w",
+                               font=ctk.CTkFont(size=11))
+            lbl.pack(side="left", fill="x", expand=True)
+            self._pl_rows.append((var, entry))
+
+        self._pl_status_lbl.configure(text=f"✅ {len(items)} items loaded. Select items and click 'Add to Queue'.")
+
+    def _pl_select_all(self):
+        for var, _ in self._pl_rows:
+            var.set(True)
+
+    def _pl_deselect_all(self):
+        for var, _ in self._pl_rows:
+            var.set(False)
+
+    def _pl_add_selected_to_queue(self):
+        """Add selected playlist items to the download queue as individual entries."""
+        selected = [(var, e) for var, e in self._pl_rows if var.get()]
+        if not selected:
+            _toast(self, "No items selected.", level="error")
+            return
+
+        fmt = self._pl_format_combo.get()
+        res = self._pl_res_combo.get()
+        fmt_selector = build_batch_format_selector(fmt, res)
+
+        added = 0
+        for _, entry in selected:
+            q_entry = {
+                "url":    entry["url"],
+                "title":  entry["title"],
+                "uploader": "",
+                "duration": "",
+                "status": "ready",
+                "row":    None,
+                "available_resolutions": [res],
+                "selected_res": res,
+                "selected_fmt": fmt,
+                "fmt_selector": fmt_selector,
+                "filesize_bytes": None,
+                "formats_raw": [],
+                "_status_lbl":   None,
+                "_progress_bar": None,
+                "_speed_lbl":    None,
+                "_size_lbl":     None,
+                "_progress_pct": 0.0,
+                "_speed_text":   "",
+            }
+            with self._dl_queue_lock:
+                self._dl_queue.append(q_entry)
+            added += 1
+
+        self._dl_render_queue()
+        self._dl_update_summary()
+        self._dl_dismiss_playlist_panel()
+        _toast(self, f"Added {added} playlist items to queue.", title="Playlist")
+
+    def _dl_update_summary(self):
+        """Recompute and refresh the overall progress bar + summary label."""
         try:
-            target_dir = Path(self.settings.get("default_download_path", str(DOWNLOADS_DIR)))
-            target_dir.mkdir(parents=True, exist_ok=True)
+            with self._dl_queue_lock:
+                items = list(self._dl_queue)
 
-            # prefer existing image
-            cur_img = getattr(self.thumbnail_label, "image_path", None)
-            if cur_img and os.path.exists(cur_img):
-                out = target_dir / Path(cur_img).name
-                shutil.copyfile(cur_img, out)
-                _toast(self, f"Thumbnail saved: {out}", title="Thumbnail")
+            if not items:
+                self.dl_overall_progress.set(0)
+                self.dl_summary_lbl.configure(text="No videos queued")
+                self.dl_speed_lbl.configure(text="")
                 return
 
-            # fallback to last metadata
-            if hasattr(self, "_last_meta"):
-                turl = self._last_meta.get("thumbnail")
-                if turl:
-                    vid = self._extract_video_id(self.single_url_entry.get().strip()) or int(time.time())
-                    target = target_dir / f"{vid}_thumbnail.jpg"
-                    thumb_path = download_thumbnail(turl, str(target))
-                    if thumb_path:
-                        _toast(self, f"Thumbnail saved: {target}", title="Thumbnail")
-                        return
+            total   = len(items)
+            done    = sum(1 for e in items if e.get("status") == "done")
+            errors  = sum(1 for e in items if e.get("status") == "error")
+            active  = [e for e in items if e.get("status") == "downloading"]
 
-            _toast(self, "No thumbnail available to save.", title="Thumbnail", level="error")
+            # Overall progress fraction
+            # Each item contributes 1.0 when done, or its current _progress_pct when downloading
+            progress_sum = done
+            for e in active:
+                progress_sum += e.get("_progress_pct", 0.0)
+            overall = progress_sum / total if total else 0.0
+            self.dl_overall_progress.set(min(overall, 1.0))
+
+            # Total size across all items that have size info
+            total_bytes = 0
+            known_size_count = 0
+            for e in items:
+                sz = e.get("filesize_bytes")
+                if sz:
+                    total_bytes += sz
+                    known_size_count += 1
+
+            # Build summary text
+            status_parts = []
+            if done:
+                status_parts.append(f"✅ {done} done")
+            if active:
+                status_parts.append(f"⬇ {len(active)} downloading")
+            if errors:
+                status_parts.append(f"✖ {errors} failed")
+            fetching = sum(1 for e in items if e.get("status") == "fetching")
+            ready    = sum(1 for e in items if e.get("status") == "ready")
+            if fetching:
+                status_parts.append(f"⏳ {fetching} fetching")
+            if ready:
+                status_parts.append(f"✔ {ready} ready")
+
+            size_str = ""
+            if known_size_count > 0:
+                size_str = f"  •  {format_filesize(total_bytes)} total"
+                if known_size_count < total:
+                    size_str += f" ({known_size_count}/{total} known)"
+
+            summary_text = "  ·  ".join(status_parts) + size_str if status_parts else f"{total} video(s) queued"
+            self.dl_summary_lbl.configure(text=summary_text)
+
         except Exception as e:
-            log_message(f"on_save_thumbnail error: {e}")
-            _toast(self, "Failed to save thumbnail.", title="Thumbnail", level="error")
+            log_message(f"_dl_update_summary error: {e}")
 
+    def _dl_render_queue(self):
+        """Full rebuild of queue rows. Only called on structural changes
+        (add / remove / status flip). NOT called during download progress."""
+        try:
+            for w in self.dl_queue_scroll.winfo_children():
+                w.destroy()
 
-    def _build_batch_tab(self, parent):
-        """Build UI for Batch Downloader tab."""
-        pad = 12
-        frame = ctk.CTkFrame(parent, corner_radius=12)
-        frame.pack(fill="both", expand=True, padx=pad, pady=pad)
-        top = ctk.CTkFrame(frame, corner_radius=10)
-        top.pack(fill="x", pady=6)
-        ctk.CTkLabel(top, text="Paste multiple video URLs (one per line):").pack(side="left", padx=6)
-        self.batch_maxres_combo = ctk.CTkComboBox(top, values=["Best Available", "720p", "1080p", "1440p", "2160p"], width=180, height=36, corner_radius=8)
-        self.batch_maxres_combo.set("Best Available")
-        self.batch_maxres_combo.pack(side="right", padx=6)
+            with self._dl_queue_lock:
+                items = list(self._dl_queue)
 
-        self.batch_text = ctk.CTkTextbox(frame, width=800, height=260, corner_radius=10)
-        self.batch_text.pack(padx=6, pady=6, fill="both", expand=True)
+            if not items:
+                lbl = ctk.CTkLabel(
+                    self.dl_queue_scroll,
+                    text="No videos added yet. Paste a URL above to get started.",
+                    text_color="#888888", font=ctk.CTkFont(size=12)
+                )
+                lbl.pack(pady=40)
+                self._dl_empty_label = lbl
+                return
 
-        bottom = ctk.CTkFrame(frame, corner_radius=10)
-        bottom.pack(fill="x", pady=6)
-        ctk.CTkLabel(bottom, text="Format:").pack(side="left", padx=6)
-        self.batch_format_combo = ctk.CTkComboBox(bottom, values=ALLOWED_FORMATS, height=36, corner_radius=8)
-        self.batch_format_combo.set(self.settings.get("default_format", "mp4"))
-        self.batch_format_combo.pack(side="left", padx=6)
+            for i, entry in enumerate(items):
+                self._dl_build_row(i, entry)
+
+            if any(e.get("status") == "fetching" for e in items):
+                self._dl_start_fetch_animation()
+
+        except Exception as e:
+            log_message(f"_dl_render_queue error: {e}")
+
+    def _dl_build_row(self, i, entry):
+        """Build a single queue row and store widget refs on the entry dict."""
+        status   = entry.get("status", "pending")
+        is_audio = entry.get("selected_fmt", "mp4") in ("mp3", "m4a")
+        is_downloading = status == "downloading"
+
+        row = ctk.CTkFrame(self.dl_queue_scroll, corner_radius=8)
+        row.pack(fill="x", padx=4, pady=3)
+        row.grid_columnconfigure(1, weight=1)
+
+        # ── Line 1: badge  title  remove ──────────────────────────────
+        badge_color, badge_text = {
+            "pending":     ("#444444", "⏺ Pending"),
+            "fetching":    ("#555555", "⏳ Fetching"),
+            "ready":       ("#1a7a3f", "✔ Ready"),
+            "downloading": (ACCENT_COLOR, "⬇ Downloading"),
+            "done":        ("#1a7a3f", "✅ Done"),
+            "error":       ("#b22222", "✖ Error"),
+        }.get(status, ("#555555", status))
+
+        status_lbl = ctk.CTkLabel(
+            row, text=badge_text, width=110, height=24,
+            fg_color=badge_color, corner_radius=6,
+            font=ctk.CTkFont(size=11)
+        )
+        status_lbl.grid(row=0, column=0, padx=(8, 6), pady=(8, 2), sticky="w")
+        entry["_status_lbl"] = status_lbl
+
+        title_text = truncate_text(entry.get("title", entry["url"]), 75)
+        if status == "error":
+            title_text = f"✖ {entry.get('error', 'Failed')}"
+        title_lbl = ctk.CTkLabel(
+            row, text=title_text, anchor="w",
+            font=ctk.CTkFont(size=12, weight="bold")
+        )
+        title_lbl.grid(row=0, column=1, sticky="w", padx=(0, 4), pady=(8, 2))
+        entry["_title_lbl"] = title_lbl
+
+        def make_remove(idx=i):
+            return lambda: self._dl_remove_item(idx)
         ctk.CTkButton(
-            bottom,
-            text="Download Batch",
-            fg_color=ACCENT_COLOR,
-            height=36,
-            corner_radius=8,
-            command=self.on_batch_download
-        ).pack(side="right", padx=6)
+            row, text="✕", width=26, height=26,
+            fg_color="transparent", hover_color="#8B0000",
+            corner_radius=6, font=ctk.CTkFont(size=12),
+            command=make_remove()
+        ).grid(row=0, column=2, padx=(0, 8), pady=(8, 2))
 
+        # ── Line 2: meta  res-combo  size ─────────────────────────────
+        meta_frame = ctk.CTkFrame(row, fg_color="transparent")
+        meta_frame.grid(row=1, column=0, columnspan=3, sticky="ew", padx=(8, 8), pady=(0, 4))
 
+        uploader = entry.get("uploader", "")
+        duration = entry.get("duration", "")
+        meta_parts = [p for p in [uploader, duration] if p]
+        meta_str = "  ·  ".join(meta_parts) if meta_parts else (
+            "Fetching info..." if status == "fetching" else "")
+        if meta_str:
+            ctk.CTkLabel(
+                meta_frame, text=meta_str, anchor="w",
+                font=ctk.CTkFont(size=11), text_color="#888888"
+            ).pack(side="left", padx=(0, 10))
 
-        ctk.CTkLabel(
-            frame,
-            text="Overall Progress:",
-            text_color="#A0A0A0",
-            anchor="w"
-        ).pack(anchor="w", padx=6, pady=(6, 0))
+        # Resolution combo — only for video formats, only when not done/error
+        if not is_audio and status not in ("done", "error"):
+            avail_res = entry.get("available_resolutions", ["Best Available"])
+            res_combo = ctk.CTkComboBox(
+                meta_frame,
+                values=avail_res,
+                width=130, height=26, corner_radius=6,
+                font=ctk.CTkFont(size=11),
+                state="normal" if status == "ready" else "disabled"
+            )
+            res_combo.set(entry.get("selected_res", "Best Available"))
+            res_combo.pack(side="left", padx=(0, 8))
 
-        self.batch_overall_progress = ctk.CTkProgressBar(
-            frame, 
-            height=8, 
-            fg_color="#2E2E2E",
-            progress_color=ACCENT_COLOR, 
-            corner_radius=4
+            sz_text = format_filesize(entry.get("filesize_bytes")) if status == "ready" else ""
+            size_lbl = ctk.CTkLabel(
+                meta_frame, text=sz_text,
+                font=ctk.CTkFont(size=11), text_color="#aaaaaa", width=80, anchor="w"
+            )
+            size_lbl.pack(side="left")
+            entry["_size_lbl"] = size_lbl
+
+            def on_res_change(choice, e=entry, lbl=size_lbl):
+                e["selected_res"] = choice
+                e["fmt_selector"] = build_format_selector_for_format_and_res(
+                    e["selected_fmt"], choice)
+                e["filesize_bytes"] = estimate_filesize_bytes(
+                    e.get("formats_raw", []), e["selected_fmt"], choice)
+                lbl.configure(text=format_filesize(e["filesize_bytes"]))
+                self._dl_update_summary()
+
+            res_combo.configure(command=on_res_change)
+
+        elif is_audio and status == "ready":
+            size_lbl = ctk.CTkLabel(
+                meta_frame, text=format_filesize(entry.get("filesize_bytes")),
+                font=ctk.CTkFont(size=11), text_color="#aaaaaa"
+            )
+            size_lbl.pack(side="left")
+            entry["_size_lbl"] = size_lbl
+
+        # ── Line 3: per-item progress bar + speed/ETA (only while downloading) ──
+        if is_downloading:
+            prog_frame = ctk.CTkFrame(row, fg_color="transparent")
+            prog_frame.grid(row=2, column=0, columnspan=3, sticky="ew",
+                            padx=(8, 8), pady=(0, 8))
+
+            pbar = ctk.CTkProgressBar(
+                prog_frame, height=6, corner_radius=3,
+                fg_color="#2E2E2E", progress_color=ACCENT_COLOR
+            )
+            pbar.set(entry.get("_progress_pct", 0.0))
+            pbar.pack(side="left", fill="x", expand=True, padx=(0, 8))
+            entry["_progress_bar"] = pbar
+
+            speed_lbl = ctk.CTkLabel(
+                prog_frame, text=entry.get("_speed_text", ""),
+                font=ctk.CTkFont(size=10), text_color="#aaaaaa", width=120, anchor="e"
+            )
+            speed_lbl.pack(side="right")
+            entry["_speed_lbl"] = speed_lbl
+        else:
+            entry["_progress_bar"] = None
+            entry["_speed_lbl"]    = None
+
+        entry["row"] = row
+        row._dl_entry = entry
+
+    def _dl_start_fetch_animation(self):
+        """Pulse the status badge of fetching rows. Uses stored _status_lbl refs — no DOM walk."""
+        if getattr(self, "_fetch_anim_running", False):
+            return
+        self._fetch_anim_running = True
+        self._fetch_anim_dots = 0
+
+        def tick():
+            with self._dl_queue_lock:
+                fetching = [e for e in self._dl_queue if e.get("status") == "fetching"]
+            if not fetching:
+                self._fetch_anim_running = False
+                return
+            self._fetch_anim_dots = (self._fetch_anim_dots + 1) % 4
+            dots = "." * self._fetch_anim_dots
+            for e in fetching:
+                lbl = e.get("_status_lbl")
+                if lbl:
+                    try:
+                        if lbl.winfo_exists():
+                            lbl.configure(text=f"⏳ Fetching{dots}")
+                    except Exception:
+                        pass
+            self.root.after(500, tick)
+
+        self.root.after(500, tick)
+
+    def _dl_remove_item(self, idx):
+        """Remove item at idx from queue and re-render."""
+        with self._dl_queue_lock:
+            if 0 <= idx < len(self._dl_queue):
+                self._dl_queue.pop(idx)
+        self._dl_render_queue()
+        self._dl_update_summary()
+
+    def _dl_clear_all(self):
+        """Clear the entire queue."""
+        with self._dl_queue_lock:
+            self._dl_queue.clear()
+        self._dl_render_queue()
+        self._dl_update_summary()
+
+    def _dl_start_all(self):
+        import shutil
+
+        with self._dl_queue_lock:
+            items = [(i, e) for i, e in enumerate(self._dl_queue)
+                     if e.get("status") in ("ready", "error")]
+
+        if not items:
+            with self._dl_queue_lock:
+                still_fetching = any(e.get("status") == "fetching" for e in self._dl_queue)
+            if still_fetching:
+                _toast(self, "Still fetching video info, please wait...", level="info")
+            else:
+                _toast(self, "No items ready to download.", level="error")
+            return
+
+        outdir = self.settings.get("default_download_path", WINDOWS_DOWNLOADS_DIR)
+        Path(outdir).mkdir(parents=True, exist_ok=True)
+
+        global_fmt      = self.settings.get("default_format", "mp4")
+        global_selector = build_format_selector_for_format_and_res(global_fmt, "Best Available")
+
+        cookies_path = self.settings.get("cookies_path", "") or None
+        filename_template = (
+            "%(uploader)s - %(title)s.%(ext)s"
+            if self.settings.get("use_smart_naming", True)
+            else "%(title)s.%(ext)s"
         )
 
-        self.batch_overall_progress.set(0)
-        self.batch_overall_progress.pack(fill="x", padx=6, pady=(0, 10))
+        self.dl_download_btn.configure(state="disabled")
+        total_count = len(items)
+
+        def dl_task():
+            completed = 0
+            for queue_idx, entry in items:
+                fmt_selector = entry.get("fmt_selector") or global_selector
+
+                # Flip status → downloading (triggers full row rebuild with progress bar)
+                self.ui_queue.put(("dl_item_status", queue_idx, "downloading", ""))
+
+                finished_event = threading.Event()
+                result = {"path": None, "error": None}
+
+                def progress_cb(percent, speed, eta, raw, _qidx=queue_idx, _entry=entry):
+                    pval = (percent or 0.0) / 100.0
+                    _entry["_progress_pct"] = pval
+                    speed_text = ""
+                    if speed:
+                        speed_text = speed
+                    if eta:
+                        speed_text += f"  ETA {eta}"
+                    _entry["_speed_text"] = speed_text
+                    self.ui_queue.put(("dl_item_progress", _qidx, pval, speed_text))
+
+                def finished_cb(path, _r=result, _ev=finished_event):
+                    _r["path"] = path
+                    _ev.set()
+
+                def error_cb(err, _r=result, _ev=finished_event):
+                    _r["error"] = err
+                    _ev.set()
+
+                self.download_proc.start_download(
+                    entry["url"], outdir, filename_template,
+                    fmt_selector, cookies_path,
+                    progress_cb, finished_cb, error_cb
+                )
+
+                while not finished_event.is_set():
+                    time.sleep(0.25)
+
+                if result["error"]:
+                    entry["_progress_pct"] = 0.0
+                    self.ui_queue.put(("dl_item_status", queue_idx, "error", result["error"]))
+                else:
+                    completed += 1
+                    entry["_progress_pct"] = 1.0
+                    append_history({
+                        "url":           entry["url"],
+                        "title":         entry.get("title", ""),
+                        "uploader":      entry.get("uploader", ""),
+                        "format":        entry.get("selected_fmt", global_fmt),
+                        "resolution":    entry.get("selected_res", "Best Available"),
+                        "download_path": outdir,
+                        "date":          now_str(),
+                    })
+                    self.ui_queue.put(("dl_item_status", queue_idx, "done", ""))
+
+            self.ui_queue.put(("dl_all_finished", completed, total_count))
+
+        threading.Thread(target=dl_task, daemon=True).start()
 
 
     def _build_playlist_tab(self, parent):
@@ -1863,16 +2341,45 @@ class ClipsterApp:
         frame = ctk.CTkFrame(parent, corner_radius=12)
         frame.pack(fill="both", expand=True, padx=12, pady=12)
 
+        # Top controls: Search and buttons
         top = ctk.CTkFrame(frame, corner_radius=10)
         top.pack(fill="x", pady=(0, 8))
+
+        # Search bar
+        search_frame = ctk.CTkFrame(top, fg_color="transparent")
+        search_frame.pack(side="left", fill="x", expand=True, padx=(6, 8), pady=6)
+        self.history_search_entry = ctk.CTkEntry(
+            search_frame, placeholder_text="Search history...",
+            height=36, corner_radius=8
+        )
+        self.history_search_entry.pack(fill="x", expand=True)
+        self.history_search_entry.bind("<KeyRelease>", self._on_history_search)
+
+        # Buttons
+        btn_frame = ctk.CTkFrame(top, fg_color="transparent")
+        btn_frame.pack(side="right", padx=(0, 6), pady=6)
         ctk.CTkButton(
-            top, 
-            text="Clear History", 
-            command=self.clear_history_prompt, 
-            fg_color="tomato", 
-            height=36, 
-            corner_radius=8
-        ).pack(side="right", padx=8, pady=6)
+            btn_frame,
+            text="⟳  Refresh",
+            command=self.refresh_history,
+            fg_color=SECONDARY_COLOR,
+            hover_color="#009aA8",
+            height=34,
+            width=110,
+            corner_radius=8,
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(
+            btn_frame,
+            text="🗑  Clear All",
+            command=self.clear_history_prompt,
+            fg_color="#C0392B",
+            hover_color="#96281B",
+            height=34,
+            width=110,
+            corner_radius=8,
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).pack(side="left")
 
         self.history_scroll = ctk.CTkScrollableFrame(frame, height=480, corner_radius=10)
         self.history_scroll.pack(fill="both", expand=True, padx=6, pady=6)
@@ -1888,57 +2395,21 @@ class ClipsterApp:
                     widget.destroy()
             except Exception:
                 pass
-        self._history_thumb_imgs.clear()
         self.history = load_history()
-        if not self.history:
-            lbl = ctk.CTkLabel(self.history_scroll, text="No history yet.", anchor="center")
+        search_term = self.history_search_entry.get().strip().lower() if hasattr(self, 'history_search_entry') else ""
+        filtered_history = self.history
+        if search_term:
+            filtered_history = [entry for entry in self.history if search_term in entry.get("title", "").lower() or search_term in entry.get("uploader", "").lower()]
+        if not filtered_history:
+            lbl = ctk.CTkLabel(self.history_scroll, text="No history yet." if not search_term else "No matches found.", anchor="center")
             lbl.pack(pady=12)
             return
 
-        for idx, entry in enumerate(self.history):
+        for idx, entry in enumerate(filtered_history):
             row = self._create_history_row(idx, entry)
             row.pack(fill="x", pady=6, padx=6)
 
-            def thumb_task(i, ent):
-                try:
-                    thumb_path = None
-                    url = ent.get("url", "")
-                    vid = self._extract_video_id(url)
-                    if vid:
-                        for p in TEMP_DIR.glob(f"*{vid}*"):
-                            if p.suffix.lower() in [".jpg", ".jpeg", ".png"]:
-                                thumb_path = str(p)
-                                break
-                    if not thumb_path:
-                        title = ent.get("title", "")
-                        safe_title_frag = "".join(c for c in title if c.isalnum() or c in (" ", "-", "_")).strip()
-                        if safe_title_frag:
-                            for p in TEMP_DIR.iterdir():
-                                if p.is_file() and safe_title_frag[:10].lower() in p.name.lower():
-                                    if p.suffix.lower() in [".jpg", ".jpeg", ".png"]:
-                                        thumb_path = str(p)
-                                        break
-                    if not thumb_path:
-                        try:
-                            meta = fetch_metadata_via_yt_dlp(url, timeout=18)
-                            if meta:
-                                turl = meta.get("thumbnail")
-                                if turl:
-                                    target = TEMP_DIR / f"hist_thumb_{vid or i}.jpg"
-                                    ok = download_thumbnail(turl, str(target))
-                                    if ok:
-                                        thumb_path = str(target)
-                        except Exception:
-                            thumb_path = None
-                    self.ui_queue.put(("history_thumb_ready", i, thumb_path))
-                except Exception:
-                    self.ui_queue.put(("history_thumb_ready", i, None))
 
-            #threading.Thread(target=thumb_task, args=(idx, entry), daemon=True).start()
-            if getattr(self, "_executor", None):
-                self.get_executor().submit(thumb_task, idx, entry)
-            else:
-                threading.Thread(target=thumb_task, args=(idx, entry), daemon=True).start()
 
     def load_and_render_history(self):
         """Load history in a background thread after startup."""
@@ -1958,16 +2429,6 @@ class ClipsterApp:
         row_frame = ctk.CTkFrame(self.history_scroll, height=100, corner_radius=10)
         row_frame.grid_columnconfigure(1, weight=1)
 
-        thumb_label = ctk.CTkLabel(
-            row_frame, 
-            text="No\nthumbnail", 
-            width=140, 
-            height=80, 
-            anchor="center", 
-            corner_radius=8
-        )
-        thumb_label.grid(row=0, column=0, rowspan=2, padx=(8,10), pady=8)
-
         title = entry.get("title", "<No title>")
         uploader = entry.get("uploader", "")
         fmt = entry.get("format", "").upper()
@@ -1978,36 +2439,50 @@ class ClipsterApp:
             info_text = f"{uploader} • {fmt} • {date}"
         else:
             info_text = f"{uploader} • {fmt} {res} • {date}"
+        row_frame.grid_columnconfigure(0, weight=1)
         title_lbl = ctk.CTkLabel(row_frame, text=title, anchor="w", font=ctk.CTkFont(size=13, weight="bold"))
-        title_lbl.grid(row=0, column=1, sticky="w", padx=(0,8), pady=(8,0))
+        title_lbl.grid(row=0, column=0, sticky="w", padx=(10,8), pady=(8,0))
         info_lbl = ctk.CTkLabel(row_frame, text=info_text, anchor="w", font=ctk.CTkFont(size=10))
-        info_lbl.grid(row=1, column=1, sticky="w", padx=(0,8), pady=(0,8))
+        info_lbl.grid(row=1, column=0, sticky="w", padx=(10,8), pady=(0,8))
 
-        btn_frame = ctk.CTkFrame(row_frame, fg_color="transparent")
-        btn_frame.grid(row=0, column=2, rowspan=2, padx=8, pady=8)
-        redl_btn = ctk.CTkButton(
-            btn_frame, 
-            text="Re-Download", 
-            fg_color=ACCENT_COLOR, 
-            width=110, 
-            height=32, 
-            corner_radius=8, 
-            command=lambda e=entry, 
-            i=idx: self.re_download(e, i)
+        # Buttons
+        theme = self.settings.get("theme", "dark")
+        hover_color = "#e0e0e0" if theme == "light" else "#3A3A3A"
+        btn_bg = "#2B2B2B" if theme == "dark" else "#E8E8E8"
+        btns = ctk.CTkFrame(row_frame, fg_color="transparent")
+        btns.grid(row=0, column=1, rowspan=2, padx=(4, 10), pady=4)
+
+        # Open in browser button
+        open_btn = ctk.CTkButton(
+            btns, text="🌐  Open",
+            width=72, height=30, corner_radius=6,
+            fg_color="#1E6B3C", hover_color="#175430",
+            font=ctk.CTkFont(size=11),
+            command=lambda: self._history_open_in_browser(entry),
         )
-        redl_btn.pack(pady=(6,4))
+        open_btn.pack(side="left", padx=(0, 4))
+
+        # Copy URL button
+        copy_btn = ctk.CTkButton(
+            btns, text="📋  Copy URL",
+            width=90, height=30, corner_radius=6,
+            fg_color="#6B3FA0", hover_color="#552F80",
+            font=ctk.CTkFont(size=11),
+            command=lambda: self._history_copy_url(entry),
+        )
+        copy_btn.pack(side="left", padx=(0, 4))
+
+        # Delete button
         del_btn = ctk.CTkButton(
-            btn_frame, 
-            text="Delete", 
-            fg_color="tomato", 
-            width=110, 
-            height=32, 
-            corner_radius=8, 
-            command=lambda i=idx: (delete_history_entry(i), self.refresh_history())
+            btns, text="✕",
+            width=30, height=30, corner_radius=6,
+            fg_color="transparent", hover_color="#C0392B",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color="#E74C3C",
+            command=lambda: self._delete_history_entry(idx),
         )
-        del_btn.pack(pady=(4,6))
+        del_btn.pack(side="left")
 
-        row_frame._thumb_label = thumb_label
         row_frame._entry = entry
         row_frame._index = idx
 
@@ -2032,11 +2507,33 @@ class ClipsterApp:
         except Exception:
             return None
 
+    def _on_history_search(self, event=None):
+        """Handle search input change."""
+        self.refresh_history()
+
     def clear_history_prompt(self):
         """Prompt to clear history."""
         if messagebox.askyesno(APP_NAME, "Clear entire download history?"):
             clear_history()
             self.refresh_history()
+
+    def _history_open_in_browser(self, entry):
+        """Open the video URL in the default web browser."""
+        url = entry.get("url", "")
+        if url:
+            webbrowser.open(url)
+
+    def _history_copy_url(self, entry):
+        """Copy the video URL to clipboard."""
+        url = entry.get("url", "")
+        if url:
+            pyperclip.copy(url)
+            _toast(self, "URL copied to clipboard")
+
+    def _delete_history_entry(self, idx):
+        """Delete a history entry."""
+        delete_history_entry(idx)
+        self.refresh_history()
 
     def _build_update_tab(self, parent):
         import webbrowser
@@ -2051,80 +2548,206 @@ class ClipsterApp:
         self.update_status_label.pack(pady=8)
 
         btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
-        btn_frame.pack(pady=10)
+        btn_frame.pack(pady=14)
 
         self.update_check_btn = ctk.CTkButton(
-            btn_frame, text="🔄 Recheck", fg_color=ACCENT_COLOR, command=self._check_update_button
+            btn_frame,
+            text="⟳  Recheck",
+            fg_color=ACCENT_COLOR,
+            hover_color="#005fa3",
+            height=36,
+            width=130,
+            corner_radius=8,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._check_update_button,
         )
         self.update_check_btn.pack(side="left", padx=6)
 
         self.update_download_btn = ctk.CTkButton(
-            btn_frame, text="⬇️ Download & Install", fg_color=SECONDARY_COLOR, command=self._download_and_install_update
+            btn_frame,
+            text="⬇️  Download & Install",
+            fg_color=SECONDARY_COLOR,
+            hover_color="#009aA8",
+            height=36,
+            width=180,
+            corner_radius=8,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._download_and_install_update,
         )
         self.update_download_btn.pack(side="left", padx=6)
 
         self.update_open_btn = ctk.CTkButton(
-            btn_frame, text="🌐 Open GitHub Page", fg_color="gray", command=lambda: webbrowser.open(GITHUB_RELEASES_URL)
+            btn_frame,
+            text="🌐  GitHub Releases",
+            fg_color="#555555",
+            hover_color="#404040",
+            height=36,
+            width=155,
+            corner_radius=8,
+            font=ctk.CTkFont(size=13),
+            command=lambda: webbrowser.open(GITHUB_RELEASES_URL),
         )
         self.update_open_btn.pack(side="left", padx=6)
 
         # Check for updates on load
-        #threading.Thread(target=self._check_for_updates, daemon=True).start()
+        threading.Thread(target=self._check_for_updates, daemon=True).start()
 
 
     # ──────────────────────────────────────────────────────────────
-    #  SETTINGS TAB – replace the whole block that creates the format entry
+    #  SETTINGS TAB
     # ──────────────────────────────────────────────────────────────
     def _build_settings_tab(self, parent):
         """Build UI for Settings tab."""
-        frame = ctk.CTkFrame(parent, corner_radius=12)
+        frame = ctk.CTkScrollableFrame(parent, corner_radius=12)
         frame.pack(fill="both", expand=True, padx=12, pady=12)
 
-        # ---------- Default format ----------
-        fmt_frame = ctk.CTkFrame(frame, fg_color="transparent")
-        fmt_frame.pack(fill="x", padx=8, pady=(8, 4))
-        ctk.CTkLabel(fmt_frame, text="Default format:", anchor="w", width=150).pack(side="left", padx=(0, 8))
-        self.settings_format_combo = ctk.CTkComboBox(fmt_frame, values=ALLOWED_FORMATS, width=180, height=36, corner_radius=8)
+        def section_label(text):
+            ctk.CTkLabel(frame, text=text, anchor="w",
+                         font=ctk.CTkFont(size=12, weight="bold"),
+                         text_color=ACCENT_COLOR).pack(fill="x", padx=8, pady=(16, 2))
+
+        def row_frame():
+            f = ctk.CTkFrame(frame, fg_color="transparent")
+            f.pack(fill="x", padx=8, pady=(4, 2))
+            return f
+
+        # ── Appearance ──────────────────────────────────────────────
+        section_label("🎨  Appearance")
+
+        tf = row_frame()
+        ctk.CTkLabel(tf, text="Theme:", anchor="w", width=160).pack(side="left", padx=(0, 8))
+        self.settings_theme_combo = ctk.CTkComboBox(tf, values=["dark", "light", "system"], width=150,
+                                                    height=36, corner_radius=8,
+                                                    command=self._on_theme_combo_changed)
+        self.settings_theme_combo.set(self.settings.get("theme", "dark"))
+        self.settings_theme_combo.pack(side="left")
+        ctk.CTkLabel(tf, text="(applies on Save)", text_color="#888888",
+                     font=ctk.CTkFont(size=11)).pack(side="left", padx=(8, 0))
+
+        # ── Downloads ───────────────────────────────────────────────
+        section_label("⬇️  Downloads")
+
+        ff = row_frame()
+        ctk.CTkLabel(ff, text="Default format:", anchor="w", width=160).pack(side="left", padx=(0, 8))
+        self.settings_format_combo = ctk.CTkComboBox(ff, values=ALLOWED_FORMATS, width=150, height=36, corner_radius=8)
         self.settings_format_combo.set(self.settings.get("default_format", "mp4"))
         self.settings_format_combo.pack(side="left")
 
-        # ---------- Theme (real ComboBox) ----------
-        theme_frame = ctk.CTkFrame(frame, fg_color="transparent")
-        theme_frame.pack(fill="x", padx=8, pady=(8, 4))
-        ctk.CTkLabel(theme_frame, text="Theme:", anchor="w", width=150).pack(side="left", padx=(0, 8))
-        self.settings_theme_combo = ctk.CTkComboBox(theme_frame, values=["dark", "light"], width=120,
-                                                    height=36, corner_radius=8, command=self._on_theme_combo_changed)
-        self.settings_theme_combo.set(self.settings.get("theme", "dark"))
-        self.settings_theme_combo.pack(side="left")
-
-        
-        
-        # ---------- Default download folder ----------
-        folder_frame = ctk.CTkFrame(frame, fg_color="transparent")
-        folder_frame.pack(fill="x", padx=8, pady=(8, 4))
-        ctk.CTkLabel(folder_frame, text="Download folder:", anchor="w", width=150).pack(side="left", padx=(0, 8))
-        self.default_download_path_entry = ctk.CTkEntry(folder_frame, width=400, height=36, corner_radius=8)
+        pf = row_frame()
+        ctk.CTkLabel(pf, text="Download folder:", anchor="w", width=160).pack(side="left", padx=(0, 8))
+        self.default_download_path_entry = ctk.CTkEntry(pf, width=360, height=36, corner_radius=8)
         self.default_download_path_entry.insert(0, self.settings.get("default_download_path", str(DOWNLOADS_DIR)))
         self.default_download_path_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        ctk.CTkButton(folder_frame, text="Browse", height=36, corner_radius=8, 
-                    command=self.on_choose_download_folder).pack(side="left")
+        ctk.CTkButton(pf, text="Browse", height=36, corner_radius=8,
+                      command=self.on_choose_download_folder).pack(side="left")
 
+        # Max concurrent downloads
+        concf = row_frame()
+        ctk.CTkLabel(concf, text="Max concurrent downloads:", anchor="w", width=160).pack(side="left", padx=(0, 8))
+        self.settings_max_dl_combo = ctk.CTkComboBox(concf, values=["1", "2", "3", "4", "5"],
+                                                     width=80, height=36, corner_radius=8)
+        self.settings_max_dl_combo.set(str(self.settings.get("max_concurrent_downloads", 1)))
+        self.settings_max_dl_combo.pack(side="left")
+
+        # ── Naming ──────────────────────────────────────────────────
+        section_label("📝  Naming")
+
+        nf = row_frame()
+        ctk.CTkLabel(nf, text="Smart naming (uploader - title):", anchor="w", width=220).pack(side="left", padx=(0, 8))
+        self.settings_smart_naming_switch = ctk.CTkSwitch(nf, text="")
+        if self.settings.get("use_smart_naming", True):
+            self.settings_smart_naming_switch.select()
+        else:
+            self.settings_smart_naming_switch.deselect()
+        self.settings_smart_naming_switch.pack(side="left")
+
+        # ── Cookies ─────────────────────────────────────────────────
+        section_label("🍪  Authentication (Cookies)")
+
+        cf = row_frame()
+        ctk.CTkLabel(cf, text="Cookies file (.txt):", anchor="w", width=160).pack(side="left", padx=(0, 8))
+        self.settings_cookies_entry = ctk.CTkEntry(cf, width=360, height=36, corner_radius=8,
+                                                    placeholder_text="Optional — for age-restricted videos")
+        self.settings_cookies_entry.insert(0, self.settings.get("cookies_path", ""))
+        self.settings_cookies_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ctk.CTkButton(cf, text="Browse", height=36, corner_radius=8,
+                      command=self._on_browse_cookies).pack(side="left")
+
+        # ── Notifications ───────────────────────────────────────────
+        section_label("🔔  Notifications")
+
+        notf = row_frame()
+        ctk.CTkLabel(notf, text="Show toast notifications:", anchor="w", width=220).pack(side="left", padx=(0, 8))
+        self.settings_toast_switch = ctk.CTkSwitch(notf, text="")
+        if self.settings.get("show_toasts", True):
+            self.settings_toast_switch.select()
+        else:
+            self.settings_toast_switch.deselect()
+        self.settings_toast_switch.pack(side="left")
+
+        # ── Debug ───────────────────────────────────────────────────
+        section_label("🛠️  Advanced / Debug")
+
+        df = row_frame()
+        ctk.CTkLabel(df, text="Debug mode (verbose log):", anchor="w", width=220).pack(side="left", padx=(0, 8))
+        self.settings_debug_switch = ctk.CTkSwitch(df, text="")
+        if self.settings.get("debug_mode", False):
+            self.settings_debug_switch.select()
+        else:
+            self.settings_debug_switch.deselect()
+        self.settings_debug_switch.pack(side="left")
+
+        lf = row_frame()
+        ctk.CTkButton(lf, text="📄 Open Log File", fg_color=SECONDARY_COLOR, height=36, corner_radius=8,
+                      command=open_log_file).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(lf, text="🗑️ Clear Log", fg_color="gray", height=36, corner_radius=8,
+                      command=self._on_clear_log).pack(side="left")
+
+        # ── Save / Reset ────────────────────────────────────────────
+        ctk.CTkFrame(frame, height=1, fg_color="#333333").pack(fill="x", padx=8, pady=(16, 6))
         btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
-        btn_frame.pack(anchor="nw", padx=8, pady=(16, 6))
+        btn_frame.pack(anchor="nw", padx=8, pady=(0, 16))
+        ctk.CTkButton(btn_frame, text="💾 Save Settings", fg_color=ACCENT_COLOR, height=36, corner_radius=8,
+                      command=self.on_apply_settings).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(btn_frame, text="↺ Reset to Defaults", fg_color="gray", height=36, corner_radius=8,
+                      command=self.on_reset_defaults).pack(side="left", padx=4)
 
-        ctk.CTkButton(btn_frame, text="Apply Settings", fg_color=ACCENT_COLOR, height=36, corner_radius=8, command=self.on_apply_settings).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(btn_frame, text="Reset to Defaults", fg_color="gray", height=36, corner_radius=8, command=self.on_reset_defaults).pack(side="left", padx=4)
-        ctk.CTkButton(btn_frame, text="Open Log File", fg_color=SECONDARY_COLOR, height=36, corner_radius=8, command=open_log_file).pack(side="left", padx=8)
+    def _on_browse_cookies(self):
+        path = filedialog.askopenfilename(
+            title="Select cookies file",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
+        )
+        if path:
+            self.settings_cookies_entry.delete(0, "end")
+            self.settings_cookies_entry.insert(0, path)
+
+    def _on_clear_log(self):
+        try:
+            if LOG_FILE.exists():
+                with open(LOG_FILE, "w", encoding="utf-8") as f:
+                    f.write(f"Clipster Log — Cleared {now_str()}\n\n")
+            _toast(self, "Log file cleared.", title="Log")
+        except Exception as e:
+            messagebox.showerror(APP_NAME, f"Could not clear log: {e}")
+
 
     def on_apply_settings(self):
-        """Apply and save settings."""
+        """Apply and save settings. Theme is applied here (not live)."""
         self.settings["default_format"] = self.settings_format_combo.get()
         self.settings["theme"] = self.settings_theme_combo.get()
         self.settings["default_download_path"] = self.default_download_path_entry.get() or str(DOWNLOADS_DIR)
+        self.settings["cookies_path"] = self.settings_cookies_entry.get().strip()
+        self.settings["use_smart_naming"] = bool(self.settings_smart_naming_switch.get())
+        self.settings["show_toasts"] = bool(self.settings_toast_switch.get())
+        self.settings["debug_mode"] = bool(self.settings_debug_switch.get())
+        try:
+            self.settings["max_concurrent_downloads"] = int(self.settings_max_dl_combo.get())
+        except Exception:
+            self.settings["max_concurrent_downloads"] = 1
         save_settings(self.settings)
         log_message(f"Settings applied: {self.settings}")
-        self._apply_theme()
-        _toast(self, "Settings applied.", title="Settings")
+        self._apply_theme()  # theme applied only on save
+        _toast(self, "Settings saved & applied.", title="Settings")
 
 
     def on_reset_defaults(self):
@@ -2136,6 +2759,26 @@ class ClipsterApp:
             self.settings_theme_combo.set("dark")
             self.default_download_path_entry.delete(0, "end")
             self.default_download_path_entry.insert(0, WINDOWS_DOWNLOADS_DIR)
+            try:
+                self.settings_cookies_entry.delete(0, "end")
+            except Exception:
+                pass
+            try:
+                self.settings_smart_naming_switch.select()
+            except Exception:
+                pass
+            try:
+                self.settings_toast_switch.select()
+            except Exception:
+                pass
+            try:
+                self.settings_debug_switch.deselect()
+            except Exception:
+                pass
+            try:
+                self.settings_max_dl_combo.set("1")
+            except Exception:
+                pass
             log_message("Settings reset to defaults")
             self._apply_theme()
             _toast(self, "Settings reset to defaults.", title="Settings")
@@ -2238,193 +2881,8 @@ class ClipsterApp:
                 pass
             self.spinner_overlay = None
 
-    def on_fetch_single_metadata(self):
-        """Fetch metadata for single video."""
-        url = self.single_url_entry.get().strip()
-        if not url:
-            messagebox.showwarning(APP_NAME, "Please enter a video URL.")
-            return
-        if not is_youtube_url(url):
-            messagebox.showwarning(APP_NAME, "URL does not look like a YouTube URL (basic check).")
-            return
-        self.fetch_meta_btn.configure(state="disabled")
-        self.show_spinner("Fetching metadata...")
-        def task():
-            try:
-                meta = fetch_metadata_via_yt_dlp(url)
-                formats = meta.get("formats", [])
-                resolutions = set()
-                for f in formats:
-                    h = f.get("height")
-                    if h:
-                        resolutions.add(f"{h}p")
-                sorted_res = sorted([r for r in resolutions], key=lambda x: int(x.replace("p","")), reverse=True)
-                if not sorted_res:
-                    sorted_res = ["Best Available"]
-                else:
-                    sorted_res.insert(0, "Best Available")
-                thumb_url = meta.get("thumbnail")
-                thumb_local = None
-                if thumb_url:
-                    thumb_local = TEMP_DIR / f"thumb_{int(time.time())}.jpg"
-                    ok = download_thumbnail(thumb_url, str(thumb_local))
-                    if not ok:
-                        thumb_local = None
-                self.ui_queue.put(("meta_fetched", meta, sorted_res, str(thumb_local) if thumb_local else None))
-            except Exception as e:
-                self.ui_queue.put(("meta_error", str(e)))
-        if getattr(self, "_executor", None):
-            self.get_executor().submit(task)
-        else:
-            threading.Thread(target=task, daemon=True).start()
-
-    def on_single_download(self):
-        import shutil
-        """Start download for single video."""
-        url = self.single_url_entry.get().strip()
-        if not url:
-            messagebox.showwarning(APP_NAME, "Please enter a video URL.")
-            return
-        fmt = self.single_format_combo.get()
-        embed_thumb = False
-        res_label = self.single_resolution_combo.get()
-        outdir = self.settings.get("default_download_path", WINDOWS_DOWNLOADS_DIR)
-        Path(outdir).mkdir(parents=True, exist_ok=True)
-        total, used, free = shutil.disk_usage(outdir)
-        if free < 500 * 1024 * 1024:
-            messagebox.showwarning(APP_NAME, "Low disk space detected! You may run out during download.")
-        fmt_selector = build_format_selector_for_format_and_res(fmt, res_label)
-        if self.settings.get("use_smart_naming", True):
-            filename_template = "%(uploader)s - %(title)s.%(ext)s"
-        else:
-            filename_template = "%(title)s.%(ext)s"
-        self.single_download_btn.configure(state="disabled")
-        # cancel button removed; notify user with a toast instead
-        _toast(self, "Download started...", title="Download", timeout=3000)
-        self.single_progress.set(0)
-        self.single_progress_label.configure(text="Starting...")
-        self.current_task_cancelled = False
-
-        self.single_pause_btn.configure(state="normal")
-
-        cookies_path = self.settings.get("cookies_path", "") or None
-
-        def progress_callback(percent, speed, eta, raw_line):
-            if percent is None:
-                progress_value = 0.0
-            else:
-                progress_value = percent/100.0
-            self.ui_queue.put(("single_progress", progress_value, speed, eta, raw_line))
-
-        def finished_callback(output_path):
-            self.ui_queue.put(("single_finished", output_path, fmt, embed_thumb, url))
-
-        def error_callback(err):
-            if "age-restricted" in str(err).lower() or "sign in to confirm your age" in str(err).lower() or "members-only" in str(err).lower():
-                self.ui_queue.put(("single_error_restricted", str(err)))
-            else:
-                self.ui_queue.put(("single_error", str(err)))
-
-        self.download_proc.start_download(url, outdir, filename_template, fmt_selector, cookies_path, progress_callback, finished_callback, error_callback)
-
-    def on_batch_download(self):
-        import shutil
-        """Start batch download (sequential & stable)."""
-        raw = self.batch_text.get("0.0", "end").strip()
-        if not raw:
-            messagebox.showwarning(APP_NAME, "Please paste at least one URL.")
-            return
-        urls = [line.strip() for line in raw.splitlines() if line.strip()]
-        if not urls:
-            messagebox.showwarning(APP_NAME, "No valid URLs detected.")
-            return
-
-        target_format = self.batch_format_combo.get()
-        max_res = self.batch_maxres_combo.get()
-        embed_thumb = False  # embed removed permanently
-        outdir = self.settings.get("default_download_path", WINDOWS_DOWNLOADS_DIR)
-        Path(outdir).mkdir(parents=True, exist_ok=True)
-        total, used, free = shutil.disk_usage(outdir)
-        if free < 500 * 1024 * 1024:
-            messagebox.showwarning(APP_NAME, "Low disk space detected! You may run out during download.")
-
-        fmt_selector = build_batch_format_selector(target_format, max_res)
-        cookies_path = self.settings.get("cookies_path", "") or None
-
-        self.batch_overall_progress.set(0)
-        total_count = len(urls)
-        completed = 0
-        self.current_task_cancelled = False
-        _toast(self, f"Downloading {total_count} videos...", title="Batch")
-
-        self.single_pause_btn.configure(state="disabled")
-
-        def batch_task():
-            nonlocal completed
-            for idx, url in enumerate(urls, start=1):
-                if self.current_task_cancelled:
-                    break
-
-                self.ui_queue.put(("batch_item_start", idx, url))
-                finished_event = threading.Event()
-                out_path_holder = {"path": None}
-                meta = {}
-
-                def progress_callback(percent, speed, eta, raw_line):
-                    pval = (percent or 0.0) / 100.0 if percent is not None else 0.0
-                    self.ui_queue.put(("batch_item_progress", idx, pval, speed, eta))
-
-                def finished_callback(output_path):
-                    out_path_holder["path"] = output_path
-                    finished_event.set()
-
-                def error_callback(err):
-                    self.ui_queue.put(("batch_item_error", idx, str(err)))
-                    finished_event.set()
-
-                filename_template = (
-                    "%(uploader)s - %(title)s.%(ext)s"
-                    if self.settings.get("use_smart_naming", True)
-                    else "%(title)s.%(ext)s"
-                )
-
-                # Run single download
-                self.download_proc.start_download(url, outdir, filename_template, fmt_selector,
-                                                cookies_path, progress_callback, finished_callback, error_callback)
-
-                while not finished_event.is_set():
-                    if self.current_task_cancelled:
-                        self.download_proc.cancel()
-                        break
-                    time.sleep(0.25)
-
-                output_path = out_path_holder["path"]
-                if not output_path:
-                    try:
-                        files = sorted(Path(outdir).glob("*"), key=lambda p: p.stat().st_mtime, reverse=True)
-                        output_path = str(files[0]) if files else None
-                    except Exception:
-                        output_path = None
-
-                # Append to history
-                entry = {
-                    "title": Path(output_path).stem if output_path else "",
-                    "url": url,
-                    "resolution": max_res,
-                    "format": target_format,
-                    "download_mode": "Batch",
-                    "download_path": outdir,
-                    "date": now_str()
-                }
-                append_history(entry)
-                completed += 1
-                self.ui_queue.put(("batch_item_done", completed, total_count))
-
-            self.ui_queue.put(("batch_finished", completed, total_count))
-
-        threading.Thread(target=batch_task, daemon=True).start()
-
-
+    
+    
     def on_fetch_playlist(self):
         """Fetch playlist items incrementally."""
         url = self.playlist_url_entry.get().strip()
@@ -2433,7 +2891,6 @@ class ClipsterApp:
             return
 
         self.show_spinner("Fetching playlist items...")
-        self._playlist_thumb_imgs = {}
         self._playlist_row_by_vid.clear()
         self._playlist_row_order.clear()
         for w in self.playlist_scroll.winfo_children():
@@ -2503,7 +2960,6 @@ class ClipsterApp:
 
         target_format = self.playlist_format_combo.get()
         max_res = self.playlist_maxres_combo.get()
-        embed_thumb = False
         outdir = self.settings.get("default_download_path", WINDOWS_DOWNLOADS_DIR)
         Path(outdir).mkdir(parents=True, exist_ok=True)
         total, used, free = shutil.disk_usage(outdir)
@@ -2570,21 +3026,10 @@ class ClipsterApp:
                             outp = str(files[0])
                     except Exception:
                         outp = None
-                embedded_flag = False
                 try:
                     meta = fetch_metadata_via_yt_dlp(url)
                 except Exception:
                     meta = {}
-                if outp and embed_thumb:
-                    try:
-                        thumb_url = meta.get("thumbnail")
-                        if thumb_url:
-                            thumbfile = TEMP_DIR / f"thumb_{int(time.time())}.jpg"
-                            ok = download_thumbnail(thumb_url, str(thumbfile))
-                            if ok:
-                                embedded_flag = embed_thumbnail_with_ffmpeg(outp, thumbfile)
-                    except Exception:
-                        embedded_flag = False
                 entry_hist = {
                     "title": Path(outp).stem if outp else entry.get("title",""),
                     "url": url,
@@ -2594,8 +3039,6 @@ class ClipsterApp:
                     "format": target_format,
                     "download_mode": "Playlist",
                     "download_path": outdir,
-                    "thumbnail_embedded": bool(embedded_flag),
-                    "redownloaded": False,
                     "date": now_str()
                 }
                 append_history(entry_hist)
@@ -2661,36 +3104,6 @@ class ClipsterApp:
 
     
 
-    def re_download(self, entry, index_in_history=None):
-        """Re-download a history entry."""
-        url = entry.get("url")
-        fmt = entry.get("format", self.settings.get("default_format", "mp4"))
-        res = entry.get("resolution", "Best Available")
-        outdir = entry.get("download_path", self.settings.get("default_download_path", WINDOWS_DOWNLOADS_DIR))
-        embed = self.settings.get("embed_thumbnail", True)
-        fmt_selector = build_format_selector_for_format_and_res(fmt, res)
-
-        cookies_path = self.settings.get("cookies_path", "") or None
-
-        def progress_callback(percent, speed, eta, rawline):
-            self.ui_queue.put(("redownload_progress", percent or 0.0, speed, eta))
-        def finished_callback(output_path):
-            entry["redownloaded"] = True
-            entry["date"] = now_str()
-            append_history(entry)
-            self.ui_queue.put(("redownload_finished", output_path))
-            self.refresh_history()
-        def error_callback(err):
-            self.ui_queue.put(("redownload_error", str(err)))
-
-        filename_template = (
-            "%(uploader)s - %(title)s.%(ext)s"
-            if self.settings.get("use_smart_naming", True)
-            else "%(title)s.%(ext)s"
-        )
-
-        self.download_proc.start_download(url, outdir, filename_template, fmt_selector, cookies_path, progress_callback, finished_callback, error_callback)
-
     def safe_ui_call(self, func, *args, **kwargs):
         """Schedule a UI call on mainloop thread but guard against destroyed widgets."""
         try:
@@ -2709,66 +3122,15 @@ class ClipsterApp:
         except Exception:
             pass
 
-    def _on_single_format_changed(self, choice):
-        """Disable resolution combo when an audio-only format is selected."""
-        audio_only = choice in ("mp3", "m4a")
-        if audio_only:
-            self.single_resolution_combo.configure(state="disabled")
-            self.single_resolution_combo.set("N/A (Audio Only)")
-        else:
-            self.single_resolution_combo.configure(state="normal")
-            current = self.single_resolution_combo.get()
-            if current == "N/A (Audio Only)":
-                self.single_resolution_combo.set("Best Available")
-
-    def _reset_single_video_ui(self):
-        """Reset Single Video tab UI for next download."""
-        try:
-            # Clear URL
-            self.single_url_entry.delete(0, "end")
-
-            # Clear metadata
-            self.meta_title_var.set("")
-            self.meta_uploader_var.set("")
-            self.meta_duration_var.set("")
-
-            # Reset resolution & format
-            self.single_resolution_combo.configure(values=["Best Available"])
-            self.single_resolution_combo.set("Best Available")
-
-            # Reset thumbnail
-            self.thumbnail_label.configure(text="Thumbnail preview", image=None)
-            self.thumbnail_label.image = None
-            if hasattr(self.thumbnail_label, "image_path"):
-                del self.thumbnail_label.image_path
-
-            # Disable Save Thumbnail button
-            self.save_thumb_btn.configure(state="disabled", fg_color="gray")
-
-            # Clear cached metadata
-            if hasattr(self, "_last_meta"):
-                del self._last_meta
-
-            # Reset progress
-            self.single_progress.set(0)
-            self.single_progress_label.configure(text="")
-
-        except Exception as e:
-            log_message(f"_reset_single_video_ui error: {e}")
-
-
     
-
 
     def cancel_download(self):
         """Cancel current download."""
-        self.download_proc.paused = False
-        self.download_proc.last_args = None
-        self.single_pause_btn.configure(state="disabled", text="Pause", command=self.pause_download)
         self.current_task_cancelled = True
         self.download_proc.cancel()
         try:
-            self.single_download_btn.configure(state="normal")
+            try: self.dl_download_btn.configure(state="normal")
+            except Exception: pass
         except Exception:
             pass
         _toast(self, "Download cancelled.", title="Cancelled", level="error")
@@ -2790,228 +3152,115 @@ class ClipsterApp:
         """Handle specific UI events from queue."""
         ev = item[0]
 
-        if ev == "meta_fetched":
-            meta, sorted_res, thumb_local = item[1], item[2], item[3]
-            self.fetch_meta_btn.configure(state="normal")
-            self.hide_spinner()
-
-            title = meta.get("title", "")
-            uploader = meta.get("uploader", "")
-            duration = meta.get("duration_string", meta.get("duration", ""))
-            self.meta_title_var.set(title)
-            self.meta_uploader_var.set(f"By: {uploader}")
-            self.meta_duration_var.set(f"Duration: {duration}")
-            self.single_resolution_combo.configure(values=sorted_res)
-            self.single_resolution_combo.set(sorted_res[0] if sorted_res else "Best Available")
-
-            # set last meta for possible thumbnail save
-            self._last_meta = meta
-
-            # thumbnail handling
-            if thumb_local and os.path.exists(str(thumb_local)):
-                try:
-                    ctkimg = self._safe_create_ctkimage(str(thumb_local), (320, 180))
-                    if ctkimg:
-                        self.thumbnail_label.configure(image=ctkimg, text="")
-                        self.thumbnail_label.image = ctkimg
-                        # remember path for Save Thumbnail feature
-                        self.thumbnail_label.image_path = str(thumb_local)
-                        # enable save button
+        if ev == "dl_item_progress":
+            # In-place update — no rebuild, just touch the widgets
+            queue_idx, pval, speed_text = item[1], item[2], item[3]
+            try:
+                with self._dl_queue_lock:
+                    entry = self._dl_queue[queue_idx] if 0 <= queue_idx < len(self._dl_queue) else None
+                if entry:
+                    pbar = entry.get("_progress_bar")
+                    if pbar:
                         try:
-                            self.save_thumb_btn.configure(state="normal", fg_color=SECONDARY_COLOR)
+                            if pbar.winfo_exists():
+                                pbar.set(pval)
                         except Exception:
                             pass
-                    else:
-                        self.thumbnail_label.configure(text="Thumbnail saved")
-                        self.save_thumb_btn.configure(state="normal")
-                except Exception:
-                    self.thumbnail_label.configure(text="Thumbnail saved")
-                    try:
-                        self.save_thumb_btn.configure(state="normal")
-                    except Exception:
-                        pass
-            else:
-                # attempt to fetch better thumbnail via constructed endpoints
-                vid = self._extract_video_id(meta.get("webpage_url", ""))
-                if vid:
-                    # try common endpoints in order
-                    candidates = [
-                        f"https://i.ytimg.com/vi/{vid}/maxresdefault.jpg",
-                        f"https://i.ytimg.com/vi/{vid}/sddefault.jpg",
-                        f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
-                    ]
-                    got = None
-                    for c in candidates:
-                        target = TEMP_DIR / f"thumb_{vid}_{Path(c).name}"
-                        if download_thumbnail(c, str(target)):
-                            got = str(target)
-                            break
-                    if got:
+                    slbl = entry.get("_speed_lbl")
+                    if slbl:
                         try:
-                            ctkimg = self._safe_create_ctkimage(got, (320, 180))
-                            if ctkimg:
-                                self.thumbnail_label.configure(image=ctkimg, text="")
-                                self.thumbnail_label.image = ctkimg
-                                self.thumbnail_label.image_path = got
-                                try:
-                                    self.save_thumb_btn.configure(state="normal", fg_color=SECONDARY_COLOR)
-                                except Exception:
-                                    pass
+                            if slbl.winfo_exists():
+                                slbl.configure(text=speed_text)
                         except Exception:
                             pass
-                    else:
-                        self.thumbnail_label.configure(text="No thumbnail available")
-                else:
-                    self.thumbnail_label.configure(text="No thumbnail available")
+            except Exception:
+                pass
+            self._dl_update_summary()
+            return
 
-            _toast(self, "Metadata fetched.", title="Fetch complete")
+        if ev == "dl_overall_progress":
+            # Legacy event — summary handles overall bar now; ignore
+            return
+
+        if ev == "dl_all_finished":
+            completed, total = item[1], item[2]
+            try:
+                self.dl_download_btn.configure(state="normal")
+            except Exception:
+                pass
+            self._dl_update_summary()
+            _toast(self, f"Download finished: {completed}/{total}", title="Download")
+            _outdir = self.settings.get("default_download_path", WINDOWS_DOWNLOADS_DIR)
+            windows_notify(
+                "Clipster",
+                f"Download finished: {completed}/{total} completed.",
+                open_path=_outdir
+            )
+            return
+
+        if ev == "dl_item_status":
+            idx, status, err = item[1], item[2], item[3]
+            with self._dl_queue_lock:
+                if 0 <= idx < len(self._dl_queue):
+                    self._dl_queue[idx]["status"] = status
+                    if status == "error":
+                        self._dl_queue[idx]["error"] = err
+            # Full rebuild needed: row layout changes (progress bar appears/disappears)
+            self._dl_render_queue()
+            self._dl_update_summary()
+            return
+
+        if ev == "dl_meta_ready":
+            idx = item[1]
+            with self._dl_queue_lock:
+                if 0 <= idx < len(self._dl_queue):
+                    self._dl_queue[idx]["status"] = "ready"
+            self._dl_render_queue()
+            self._dl_update_summary()
             return
 
 
+        if ev == "meta_fetched":
+            # Handled via dl_meta_ready in v1.3.0 queue system
+            return
+
         if ev == "meta_error":
-            err = item[1]
-            self.fetch_meta_btn.configure(state="normal")
-            self.hide_spinner()
-            if "age-restricted" in err.lower() or "sign in to confirm your age" in err.lower() or "members-only" in err.lower():
-                messagebox.showerror(APP_NAME, "This video is age-restricted or members-only and requires sign-in. Clipster cannot download it.\n\nTip: use yt-dlp with a cookies file (manual).")
-            else:
-                messagebox.showerror(APP_NAME, f"Failed to fetch metadata: {err}")
-            _toast(self, "Ready")
+            # Handled via dl_meta_error in v1.3.0 queue system
             return
 
         if ev == "single_progress":
-            progress_value, speed, eta, raw_line = item[1], item[2], item[3], item[4]
-            try:
-                self.single_progress.set(progress_value)
-                label = f"{int(progress_value*100)}%"
-                if speed:
-                    label += f" — {speed}"
-                if eta:
-                    label += f" — ETA {eta}"
-                self.single_progress_label.configure(text=label)
-            except Exception:
-                pass
+            # progress routed through dl_overall_progress in v1.3.0
+            progress_value = item[1]
+            try: self.dl_overall_progress.set(progress_value)
+            except Exception: pass
             return
 
         if ev == "single_finished":
-            self.single_pause_btn.configure(text="Pause", command=self.pause_download)
-            output_path, fmt, embed_thumb, url = item[1], item[2], item[3], item[4]
-            if not output_path:
-                outdir = self.settings.get("default_download_path", WINDOWS_DOWNLOADS_DIR)
-                files = list(Path(outdir).glob("*"))
-                files = [f for f in files if f.is_file()]
-                if files:
-                    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-                    output_path = str(files[0])
-            embedded_flag = False
-            if output_path and embed_thumb:
-                try:
-                    meta = fetch_metadata_via_yt_dlp(url)
-                    thumb_url = meta.get("thumbnail")
-                    if thumb_url:
-                        thumbfile = TEMP_DIR / f"thumb_{int(time.time())}.jpg"
-                        ok = download_thumbnail(thumb_url, str(thumbfile))
-                        if ok:
-                            embedded_flag = embed_thumbnail_with_ffmpeg(output_path, thumbfile)
-                except Exception:
-                    embedded_flag = False
-            title = Path(output_path).stem if output_path else ""
-            entry = {
-                "title": title,
-                "url": url,
-                "uploader": "",
-                "duration": "",
-                "resolution": self.single_resolution_combo.get(),
-                "format": fmt,
-                "download_mode": "Single",
-                "download_path": str(Path(output_path).parent) if output_path else self.settings.get("default_download_path", WINDOWS_DOWNLOADS_DIR),
-                "thumbnail_embedded": bool(embedded_flag),
-                "redownloaded": False,
-                "date": now_str()
-            }
-            append_history(entry)
-            self.single_download_btn.configure(state="normal")
-            self.single_progress.set(0)
-            self.single_progress_label.configure(text="")
-            filename = Path(output_path).name if output_path else "File"
-            windows_notify(
-                "Clipster",
-                f"Download finished:\n{filename}",
-                open_path=output_path
-            )
-
-            self.single_pause_btn.configure(state="disabled")
-            self.refresh_history()
-
-            self._reset_single_video_ui()
+            # In v1.3.0 queue, dl_item_status "done" handles per-item completion
             return
-
         if ev == "single_error_restricted":
             err = item[1]
-            self.single_download_btn.configure(state="normal")
-            self.single_progress.set(0)
-            self.single_progress_label.configure(text="")
-            self.hide_spinner()
-            messagebox.showerror(APP_NAME, "This video requires you to be signed in (age-restricted or members-only). Clipster cannot download it without authentication.\n\nTip: use yt-dlp with a cookies file.")
-            _toast(self, "Ready")
+            messagebox.showerror(APP_NAME, "This video requires sign-in (age-restricted or members-only).\n\nTip: use yt-dlp with a cookies file.")
+            try: self.dl_download_btn.configure(state="normal")
+            except Exception: pass
             return
 
         if ev == "single_error":
             err = item[1]
-            self.single_download_btn.configure(state="normal")
-            self.single_progress.set(0)
-            self.single_progress_label.configure(text="")
-            self.hide_spinner()
             messagebox.showerror(APP_NAME, f"Download failed: {err}")
-            _toast(self, "Ready")
+            try: self.dl_download_btn.configure(state="normal")
+            except Exception: pass
             return
-
-        if ev == "batch_item_start":
-            idx, url = item[1], item[2]
-            _toast(self, f"Downloading item {idx}...", title="Downloading", timeout=2000)
-            return
-
-        if ev == "batch_item_progress":
-            idx, percent, speed, eta = item[1], item[2], item[3], item[4]
-            self.batch_overall_progress.set(percent or 0.0)
-            return
-
-        if ev == "batch_item_error":
-            idx, err = item[1], item[2]
-            messagebox.showerror(APP_NAME, f"Batch item {idx} error: {err}")
-            return
-
-        if ev == "batch_item_done":
-            completed, total = item[1], item[2]
-            overall = completed / total if total else 0.0
-            self.batch_overall_progress.set(overall)
-            _toast(self, f"Batch progress: {completed}/{total}", timeout=2200)
-            self.refresh_history()
-            return
-
-        if ev == "batch_finished":
-            completed, total = item[1], item[2]
-            self.batch_overall_progress.set(1.0)
-            windows_notify(
-                "Clipster",
-                f"Batch finished: {completed}/{total} downloads complete."
-            )
-            self.refresh_history()
-            return
-
         if ev == "playlist_item_add":
             idx, entry = item[1], item[2]
             row = ctk.CTkFrame(self.playlist_scroll, height=80)
-            row.grid_columnconfigure(2, weight=1)
+            row.grid_columnconfigure(1, weight=1)
             sel_var = ctk.BooleanVar(value=True)
             chk = ctk.CTkCheckBox(row, text="", variable=sel_var)
             chk.grid(row=0, column=0, padx=(8,6), pady=10)
-            spinner_lbl = ctk.CTkLabel(row, text="⏳", width=100, height=60, anchor="center")
-            spinner_lbl.grid(row=0, column=1, padx=(6, 10), pady=6)
             title_lbl = ctk.CTkLabel(row, text=f"{idx}. {entry.get('title','<No title>')}", anchor="w", font=ctk.CTkFont(size=12))
             title_lbl.grid(row=0, column=2, sticky="w", padx=(0, 8), pady=4)
             row.pack(fill="x", padx=6, pady=4)
-            row._thumb_label = spinner_lbl
             row._entry = entry
             row._video_id = entry.get("id")
             row._selected_var = sel_var
@@ -3042,20 +3291,7 @@ class ClipsterApp:
             except Exception:
                 pass
 
-            def thumb_task(e):
-                try:
-                    vid = e.get("id")
-                    thumb_url = f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
-                    target = TEMP_DIR / f"pl_thumb_{vid}.jpg"
-                    if not target.exists():
-                        download_thumbnail(thumb_url, str(target))
-                    self.ui_queue.put(("playlist_thumb_ready", vid, str(target) if target.exists() else None))
-                except Exception:
-                    self.ui_queue.put(("playlist_thumb_ready", e.get("id"), None))
-            if getattr(self, "_executor", None):
-                self.get_executor().submit(thumb_task, entry)
-            else:
-                threading.Thread(target=thumb_task, args=(entry,), daemon=True).start()
+
             return
 
         if ev == "playlist_fetch_done":
@@ -3075,59 +3311,21 @@ class ClipsterApp:
             _toast(self, "Ready")
             return
 
-        if ev == "playlist_thumb_ready":
-            vid = item[1]
-            thumb_path = item[2]
-            row = self._playlist_row_by_vid.get(vid)
-            if row:
-                lbl = getattr(row, "_thumb_label", None)
-                if lbl:
-                    ok = self._set_label_image_from_path(lbl, thumb_path, size=(100, 60), fallback_text="No thumb")
-                    if ok:
-                        try:
-                            self._playlist_thumb_imgs[vid] = lbl.image
-                        except Exception:
-                            pass
-            return
-
-        if ev == "history_thumb_ready":
-            idx = item[1]
-            thumb_path = item[2]
-            for child in self.history_scroll.winfo_children():
-                if getattr(child, "_index", None) == idx:
-                    lbl = getattr(child, "_thumb_label", None)
-                    if lbl:
-                        ok = self._set_label_image_from_path(lbl, thumb_path, size=(140, 80), fallback_text="No\nthumbnail")
-                        if ok:
-                            try:
-                                self._history_thumb_imgs[idx] = lbl.image
-                            except Exception:
-                                pass
-                    break
-            return
-
-        if ev == "redownload_progress":
-            percent, speed, eta = item[1], item[2], item[3]
+        if ev == "pl_inline_items_ready":
+            items = item[1]
             try:
-                self.status_var.set(f"Re-downloading... {int(percent*100)}%")
+                self._pl_render_items(items)
+            except Exception as e:
+                log_message(f"pl_inline_items_ready render error: {e}")
+            return
+
+        if ev == "pl_inline_error":
+            err = item[1]
+            try:
+                self._pl_status_lbl.configure(text=f"❌ Error: {err}")
             except Exception:
                 pass
-            return
-
-        if ev == "redownload_finished":
-            output_path = item[1]
-            filename = Path(output_path).name if output_path else "File"
-            windows_notify(
-                "Clipster",
-                f"Re-download finished:\n{filename}",
-                open_path=output_path
-            )
-            self.refresh_history()
-            return
-
-        if ev == "redownload_error":
-            err = item[1]
-            messagebox.showerror(APP_NAME, f"Re-download error: {err}")
+            _toast(self, f"Playlist fetch failed: {err}", level="error")
             return
 
         if ev == "playlist_row_progress":
@@ -3139,6 +3337,7 @@ class ClipsterApp:
                         row._progress.set(pval)
                 except Exception:
                     pass
+            return
 
 
         if ev == "playlist_row_error":
@@ -3175,9 +3374,11 @@ class ClipsterApp:
         if ev == "playlist_seq_finished":
             completed, total = item[1], item[2]
             self.playlist_overall_progress.set(1.0)
+            _outdir = self.settings.get("default_download_path", WINDOWS_DOWNLOADS_DIR)
             windows_notify(
                 "Clipster",
-                f"Playlist finished: {completed}/{total} downloads complete."
+                f"Playlist finished: {completed}/{total} downloads complete.",
+                open_path=_outdir
             )
             self.refresh_history()
             return
@@ -3216,16 +3417,10 @@ if __name__ == "__main__":
     try:
         ensure_directories()    
         root = ctk.CTk()
-        root.withdraw()  # hide main window
-
-        splash = SplashScreen(root)
-
-        def start_app():
-            splash.fade_out_and_destroy()  # ✨ fade-out
-            app = ClipsterApp(root)
-
-        # Keep splash visible for ~1.5 sec (or adjust)
-        root.after(1500, start_app)
+        
+        # Create and initialize the app directly (no splash screen)
+        app = ClipsterApp(root)
+        _app = app
 
         root.mainloop()
 
