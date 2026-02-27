@@ -4,7 +4,42 @@ All notable changes to **Clipster** are documented here.
 
 ---
 
-# Changelog
+## [1.3.1] - 2026-02-27
+
+### 🚀 Major Download System Upgrade
+
+- Introduced brand-new queue-based download architecture
+- Multi-item download queue inside Download tab
+- Per-item progress bars
+- Per-item cancel support
+- Overall download progress summary bar
+- Live speed + ETA display per video
+
+### 📋 Inline Playlist Panel (New)
+
+- Playlist auto-detection in Download tab
+- Inline playlist item fetching
+- Select / Deselect controls
+- Add selected playlist items directly to queue
+- Format & max resolution selection before adding
+
+### 🎯 UX Improvements
+
+- Resolution selector per queued video
+- Dynamic file size estimation updates
+- Cleaner progress rendering without full UI re-render
+- Better error message sanitization from yt-dlp
+- Improved queue summary display
+
+### 🧠 Stability & Architecture
+
+- Thread-safe per-item progress updates
+- Reduced UI redraw overhead during downloads
+- Improved cancellation handling per queue item
+- Better background thread synchronization
+- Improved history write consistency
+
+---
 
 ## [1.3.0] - 2026-02-19
 

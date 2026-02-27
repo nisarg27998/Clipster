@@ -33,9 +33,13 @@ _HISTORY_RW_LOCK = threading.RLock()
 # Branding / Config
 # --------------------------------------------
 APP_NAME = "Clipster"
-APP_VERSION = "1.3.0"
-ACCENT_COLOR = "#0078D7"
-SECONDARY_COLOR = "#00B7C2"
+APP_VERSION = "1.3.1"
+ACCENT_COLOR = "#2563EB"          # Vibrant blue (Tailwind blue-600)
+ACCENT_HOVER  = "#1D4ED8"         # Darker blue hover
+SECONDARY_COLOR = "#0891B2"       # Cyan-600
+SECONDARY_HOVER = "#0E7490"       # Cyan-700
+DANGER_COLOR  = "#DC2626"         # Red-600
+SUCCESS_COLOR = "#16A34A"         # Green-600
 SPLASH_TEXT = "Fetch. Download. Enjoy."
 
 GITHUB_REPO = "nisarg27998/Clipster"
@@ -55,7 +59,7 @@ SETTINGS_FILE = BASE_DIR / "settings.json"
 YT_DLP_EXE = ASSETS_DIR / "yt-dlp.exe"
 FFMPEG_EXE = ASSETS_DIR / "ffmpeg.exe"
 FFPROBE_EXE = ASSETS_DIR / "ffprobe.exe"
-FFPLAY_EXE = ASSETS_DIR / "ffplay.exe"
+# ffplay removed — preview opens in browser instead
 
 ALLOWED_FORMATS = ["mp4", "mkv", "webm", "m4a", "mp3"]
 
@@ -130,6 +134,38 @@ def truncate_text(text, max_chars=80):
     return text if len(text) <= max_chars else text[:max_chars-1] + "…"
 
 
+# Patterns that make yt-dlp errors noisy and technical-looking
+_YTDLP_ERROR_STRIP_RE = re.compile(
+    r"ERROR:\s*"                        # leading ERROR: label
+    r"(\[[^\]]+\]\s*)+"                 # [youtube] [some_id] prefixes
+    r"([A-Za-z0-9_\-]{6,20}:\s*)?",    # optional video-id: prefix
+    re.IGNORECASE,
+)
+_YTDLP_NOISE_RE = re.compile(
+    r"(yt-dlp exited with code -?\d+\.?\s*)"  # exit-code suffix
+    r"|(WARNING:.*$)"                          # trailing WARNING lines
+    r"|(https?://\S+)",                        # bare URLs
+    re.MULTILINE,
+)
+
+def sanitize_ytdlp_error(raw: str) -> str:
+    """Strip yt-dlp boilerplate from error messages so they read naturally."""
+    if not raw:
+        return "Download failed."
+    msg = raw.strip()
+    # Remove leading ERROR: [youtube] [id]: noise
+    msg = _YTDLP_ERROR_STRIP_RE.sub("", msg).strip()
+    # Remove exit-code lines, WARNING lines, bare URLs
+    msg = _YTDLP_NOISE_RE.sub("", msg).strip()
+    # Collapse whitespace / newlines
+    msg = re.sub(r"\s+", " ", msg).strip(": ")
+    # Fall back if we stripped everything
+    if not msg or len(msg) < 4:
+        msg = "Download failed — check log for details."
+    # Capitalise first letter
+    return msg[0].upper() + msg[1:]
+
+
 
 def safe_filename(name: str, max_len=200, default="file"):
     if not name:
@@ -191,7 +227,7 @@ def ensure_directories():
 def check_executables():
     """Check for required executables in Assets/."""
     missing = []
-    for exe in [YT_DLP_EXE, FFMPEG_EXE, FFPROBE_EXE, FFPLAY_EXE]:
+    for exe in [YT_DLP_EXE, FFMPEG_EXE, FFPROBE_EXE]:
         if not exe.exists():
             missing.append(exe.name)
     return missing
@@ -466,50 +502,99 @@ def show_toast(root, message, title=None, timeout=3000, level="info", theme="dar
 def windows_notify(title, message, open_path=None):
     """Show a Windows 11 toast notification.
 
-    open_path: if given and exists, clicking the notification opens
-               that folder in Explorer. Uses win11toast's `launch`
-               parameter with a file:// URI — avoids the broken
-               on_click lambda behaviour that causes the
-               {'arguments': 'http:', 'user_input': {}} error.
+    Clicking the notification brings the Clipster window to the front.
+    If open_path is given and exists, it is also opened in Explorer.
+    Uses a background thread for the blocking win11toast call so the
+    main thread is never stalled.
     """
+    if not _is_windows():
+        return
+
+    def _fire():
+        try:
+            from win11toast import toast as _win11_toast
+
+            kwargs = {
+                "title":    title,
+                "body":     message,
+                "duration": "short",
+                "app_id":   "Clipster.App.1.3.1",
+            }
+
+            # App icon in the notification badge
+            icon_path = ASSETS_DIR / "clipster.png"
+            if icon_path.exists():
+                kwargs["icon"] = {"src": str(icon_path), "placement": "appLogoOverride"}
+
+            # on_click: bring window to front, optionally open the folder.
+            # Runs on a background thread — app may be closed, so guard everything.
+            def _on_click(args=None):
+                try:
+                    if open_path and Path(open_path).exists():
+                        os.startfile(open_path)
+                except Exception:
+                    pass
+                try:
+                    app = _app
+                    if app is None:
+                        return
+                    root = getattr(app, "root", None)
+                    if root is None:
+                        return
+                    # Check the widget still exists before scheduling anything
+                    root.after(0, _bring_window_to_front)
+                except Exception as e:
+                    log_message("notification on_click error (app may be closed): " + str(e))
+
+            kwargs["on_click"] = _on_click
+
+            _win11_toast(**kwargs)
+
+        except Exception as e:
+            log_message(f"windows_notify error: {e}")
+
+    threading.Thread(target=_fire, daemon=True).start()
+
+
+def _bring_window_to_front():
+    """Restore and focus the Clipster window from any state."""
     try:
-        if not _is_windows():
+        app = _app
+        if not app or not getattr(app, "root", None):
             return
-
-        from win11toast import toast
-
-        kwargs = {
-            "title":    title,
-            "body":     message,
-            "duration": "short",
-            "app_id":   "Clipster.App.1.3",
-        }
-
-        # App icon in the notification badge
-        icon_path = ASSETS_DIR / "clipster.png"
-        if icon_path.exists():
-            kwargs["icon"] = {"src": str(icon_path), "placement": "appLogoOverride"}
-
-        # Note: Click actions removed due to win11toast API changes
-        # Clicking the notification will bring the app to focus by default
-
-        toast(**kwargs)
-
+        root = app.root
+        # Un-minimise if iconified
+        if root.state() == "iconic":
+            root.deiconify()
+        root.lift()
+        root.attributes("-topmost", True)
+        root.after(150, lambda: root.attributes("-topmost", False))
+        root.focus_force()
     except Exception as e:
-        log_message(f"windows_notify error: {e}")
+        log_message(f"_bring_window_to_front error: {e}")
 
 
 
 
 # convenience wrapper that checks settings
 def _toast(app, message, title=None, timeout=3000, level="info"):
-    """Thread-safe wrapper for showing toasts."""
+    """Thread-safe wrapper: uses Windows native notifications when available,
+    falls back to in-app toast for minor/transient messages."""
     if not getattr(app, "settings", None):
         return
     if not app.settings.get("show_toasts", True):
         return
-    
-    # Fix: Ensure UI creation happens on the main thread
+
+    # Use Windows native notification for important events (errors, completions)
+    if _is_windows() and level in ("error", "success") or (title and title not in ("", None)):
+        try:
+            notify_title = title or APP_NAME
+            windows_notify(notify_title, message)
+            return
+        except Exception:
+            pass
+
+    # Fallback: in-app toast (transient, minor feedback)
     if threading.current_thread() is threading.main_thread():
         try:
             show_toast(app.root, message, title=title, timeout=timeout, level=level, theme=app.settings.get("theme","dark"))
@@ -834,6 +919,24 @@ def build_batch_format_selector(target_format, max_resolution_label):
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("blue")
 
+def _lerp_color(hex_a, hex_b, t):
+    t = max(0.0, min(1.0, t))
+    ra, ga, ba = int(hex_a[1:3], 16), int(hex_a[3:5], 16), int(hex_a[5:7], 16)
+    rb, gb, bb = int(hex_b[1:3], 16), int(hex_b[3:5], 16), int(hex_b[5:7], 16)
+    r = int(ra + (rb - ra) * t)
+    g = int(ga + (gb - ga) * t)
+    b = int(ba + (bb - ba) * t)
+    return f"#{r:02X}{g:02X}{b:02X}"
+
+
+class _TabCompat:
+    """Minimal shim so code using self.tabs.tab(name) works after CTkTabview replacement."""
+    def __init__(self, frames):
+        self._frames = frames
+    def tab(self, name):
+        return self._frames[name]
+
+
 class ClipsterApp:
     """Main application class for Clipster GUI."""
 
@@ -859,8 +962,8 @@ class ClipsterApp:
             pass
 
         self.root.title(f"{APP_NAME} - {SPLASH_TEXT}")
-        self.root.geometry("1000x700")
-        self.root.minsize(900, 600)
+        self.root.geometry("1060x740")
+        self.root.minsize(920, 620)
 
         # Set window icon — will be reinforced by _create_titlebar via WM_SETICON
         try:
@@ -905,18 +1008,265 @@ class ClipsterApp:
         self.root.after(0, self._show_window_after_setup)
 
     def _build_skeleton_ui(self):
-        """Build minimal UI shell for fast startup."""
+        """Build minimal UI shell with custom animated tab system."""
         self._create_titlebar()
-        self.tabs = ctk.CTkTabview(self.root, width=980, height=540, corner_radius=12)
-        self.tabs.pack(padx=12, pady=6, fill="both", expand=True)
+        self._tab_names = ["Download", "History", "Settings", "Update"]
+        self._tab_icons = {"Download": "⏬", "History": "🕘", "Settings": "⚙️", "Update": "🔄"}
+        self._current_tab = None
+        self._tab_anim_running = False
+        self._tab_frames = {}          # name -> CTkFrame (content panel)
+        self._tab_built   = {}         # name -> bool
+        self._tab_btns    = {}         # name -> CTkButton
+        self._shimmer_running = False
 
-        for name in (
-            "Download",
-            "History",
-            "Settings",
-            "Update",
-        ):
-            self.tabs.add(name)
+        # Outer wrapper
+        self._tab_outer = ctk.CTkFrame(self.root, corner_radius=0, fg_color="transparent")
+        self._tab_outer.pack(padx=12, pady=(4, 8), fill="both", expand=True)
+
+        # Custom tab bar — centered, underline-style tabs
+        self._tabbar = ctk.CTkFrame(self._tab_outer, height=52, corner_radius=0, fg_color="transparent")
+        self._tabbar.pack(fill="x", pady=(0, 0))
+        self._tabbar.pack_propagate(False)
+
+        # Bottom border line for the whole tab bar
+        self._tabbar_border = ctk.CTkFrame(self._tab_outer, height=2, corner_radius=0, fg_color="#2A2A3A")
+        self._tabbar_border.pack(fill="x", pady=(0, 6))
+
+        # Inner centering frame
+        self._tabbar_inner = ctk.CTkFrame(self._tabbar, fg_color="transparent")
+        self._tabbar_inner.place(relx=0.5, rely=0.5, anchor="center")
+
+        for name in self._tab_names:
+            icon = self._tab_icons.get(name, "")
+            # Each tab is a frame containing a label + animated underline bar
+            tab_wrap = ctk.CTkFrame(self._tabbar_inner, fg_color="transparent", cursor="hand2")
+            tab_wrap.pack(side="left", padx=4)
+
+            lbl = ctk.CTkLabel(
+                tab_wrap,
+                text=f"{icon}  {name}",
+                height=36,
+                font=ctk.CTkFont(size=13),
+                text_color="#777777",
+                padx=16,
+            )
+            lbl.pack(side="top")
+
+            # Underline indicator — hidden by default
+            indicator = ctk.CTkFrame(tab_wrap, height=3, corner_radius=2, fg_color=ACCENT_COLOR)
+            indicator.pack(fill="x", padx=8, pady=(0, 0))
+            indicator.pack_forget()   # hidden initially
+
+            # Store refs
+            self._tab_btns[name] = (tab_wrap, lbl, indicator)
+
+            # Bind clicks on both wrap and label
+            for widget in (tab_wrap, lbl):
+                widget.bind("<Button-1>", lambda e, n=name: self._switch_tab(n))
+                widget.bind("<Enter>", lambda e, l=lbl, n=name: self._on_tab_hover(l, n, True))
+                widget.bind("<Leave>", lambda e, l=lbl, n=name: self._on_tab_hover(l, n, False))
+
+        # Content host
+        self._content_host = ctk.CTkFrame(self._tab_outer, corner_radius=12)
+        self._content_host.pack(fill="both", expand=True)
+
+        # Create all tab frames stacked in the same host (only one visible at a time)
+        for name in self._tab_names:
+            f = ctk.CTkFrame(self._content_host, corner_radius=12, fg_color="transparent")
+            f.place(relx=0, rely=0, relwidth=1, relheight=1)
+            f.lower()
+            self._tab_frames[name] = f
+            self._tab_built[name]  = False
+
+        # Compatibility shim so existing code calling self.tabs.tab(name) still works
+        self.tabs = _TabCompat(self._tab_frames)
+
+        # Activate the first tab after UI settles (content not built yet)
+        self.root.after(60, lambda: self._switch_tab("Download", animated=False))
+
+    def _on_tab_hover(self, lbl, name, entering):
+        """Lighten label on hover if not the active tab."""
+        if name == self._current_tab:
+            return
+        lbl.configure(text_color="#CCCCCC" if entering else "#777777")
+
+    # Tab switching with animation
+    def _switch_tab(self, name, animated=True):
+        """Switch to the named tab with a fade+slide-up animation."""
+        if name == self._current_tab:
+            return
+        if self._tab_anim_running:
+            return
+
+        prev = self._current_tab
+        self._current_tab = name
+
+        # Update tab label + indicator styles
+        for n, (wrap, lbl, indicator) in self._tab_btns.items():
+            if n == name:
+                lbl.configure(text_color="white",
+                              font=ctk.CTkFont(size=13, weight="bold"))
+                indicator.pack(fill="x", padx=8, pady=(0, 0))
+                self._animate_indicator(indicator, 0, 1)
+            else:
+                lbl.configure(text_color="#777777",
+                              font=ctk.CTkFont(size=13))
+                indicator.pack_forget()
+
+        new_frame  = self._tab_frames[name]
+        prev_frame = self._tab_frames.get(prev) if prev else None
+
+        # Build content lazily on first visit
+        if not self._tab_built[name]:
+            self._show_tab_skeleton(new_frame)
+            new_frame.lift()
+            if prev_frame:
+                prev_frame.lower()
+            self.root.after(80, lambda: self._lazy_build_tab(name, new_frame, animated))
+            return
+
+        self._animate_tab_in(new_frame, prev_frame, animated)
+
+    def _animate_indicator(self, indicator, step=0, total=8):
+        """Animate the underline indicator width growing in from left."""
+        try:
+            if not indicator.winfo_exists():
+                return
+            if step >= total:
+                return
+            # We use padx to simulate a growing width: start with big padx, shrink to 8
+            progress = step / total
+            ease = 1 - (1 - progress) ** 2
+            pad = int(8 + (40 * (1 - ease)))
+            indicator.pack_configure(padx=pad)
+            indicator.after(14, lambda: self._animate_indicator(indicator, step + 1, total))
+        except Exception:
+            pass
+
+    def _lazy_build_tab(self, name, frame, animated):
+        """Build the real tab content, then animate it in."""
+        self._shimmer_running = False
+        for w in frame.winfo_children():
+            try:
+                w.destroy()
+            except Exception:
+                pass
+
+        try:
+            build_fn = {
+                "Download": self._build_download_tab,
+                "History":  self._build_history_tab,
+                "Settings": self._build_settings_tab,
+                "Update":   self._build_update_tab,
+            }.get(name)
+            if build_fn:
+                build_fn(frame)
+        except Exception as e:
+            log_message(f"_lazy_build_tab error for {name}: {e}")
+
+        self._tab_built[name] = True
+        self._animate_tab_in(frame, None, animated)
+
+    def _show_tab_skeleton(self, frame):
+        """Show a shimmer skeleton loader while the tab content is being built."""
+        for w in frame.winfo_children():
+            try:
+                w.destroy()
+            except Exception:
+                pass
+
+        theme = self.settings.get("theme", "dark")
+        base_color  = "#1E1E2E" if theme == "dark" else "#E8E8F0"
+        shine_color = "#2A2A3E" if theme == "dark" else "#F0F0FA"
+
+        wrapper = ctk.CTkFrame(frame, fg_color="transparent")
+        wrapper.pack(fill="both", expand=True, padx=16, pady=16)
+
+        bar_configs = [
+            (1.0, 44),
+            (1.0, 14),
+            (1.0, 120),
+            (1.0, 80),
+            (0.6, 40),
+        ]
+        self._skeleton_bars = []
+        for rel_w, h in bar_configs:
+            bar = ctk.CTkFrame(wrapper, height=h, corner_radius=10, fg_color=base_color)
+            bar.pack(fill="x", pady=5)
+            self._skeleton_bars.append((bar, base_color, shine_color))
+
+        self._skeleton_phase = 0.0
+        self._shimmer_running = True
+
+        import math
+
+        def shimmer():
+            if not self._shimmer_running:
+                return
+            try:
+                t = self._skeleton_phase
+                alpha = (1 + math.sin(t * 3.14159)) / 2
+                for bar, bc, sc in self._skeleton_bars:
+                    try:
+                        if bar.winfo_exists():
+                            color = _lerp_color(bc, sc, alpha)
+                            bar.configure(fg_color=color)
+                    except Exception:
+                        pass
+                self._skeleton_phase += 0.08
+                frame.after(40, shimmer)
+            except Exception:
+                pass
+
+        frame.after(40, shimmer)
+
+    def _animate_tab_in(self, frame, prev_frame, animated):
+        """Fade + slide-up animation for the incoming tab frame."""
+        self._shimmer_running = False
+
+        if not animated:
+            frame.lift()
+            if prev_frame:
+                prev_frame.lower()
+            return
+
+        self._tab_anim_running = True
+        STEPS   = 12
+        STEP_MS = 16
+
+        def step(i=0):
+            if i > STEPS:
+                try:
+                    frame.place(relx=0, rely=0, relwidth=1, relheight=1)
+                    frame.lift()
+                    if prev_frame:
+                        prev_frame.lower()
+                        prev_frame.place(relx=0, rely=0, relwidth=1, relheight=1)
+                except Exception:
+                    pass
+                self._tab_anim_running = False
+                return
+
+            progress = i / STEPS
+            ease = 1 - (1 - progress) ** 3
+            rely = 0.02 * (1 - ease)
+
+            if prev_frame:
+                prev_rely = -0.02 * ease
+                try:
+                    prev_frame.place(relx=0, rely=prev_rely, relwidth=1, relheight=1)
+                except Exception:
+                    pass
+
+            try:
+                frame.place(relx=0, rely=rely, relwidth=1, relheight=1)
+                frame.lift()
+            except Exception:
+                pass
+
+            frame.after(STEP_MS, lambda: step(i + 1))
+
+        step()
 
 
     def _check_for_updates(self):
@@ -1005,15 +1355,6 @@ class ClipsterApp:
                     except Exception:
                         pass
                     pass  # cancel btn removed in v1.3.0
-                    # ffplay preview
-                    try:
-                        # store missing set to check before preview
-                        self._missing_exes = set(missing)
-                        if "ffplay.exe" in missing:
-                            # you had a preview button in playlist; detect and disable play preview operations
-                            pass
-                    except Exception:
-                        pass
                 self.safe_ui_call(disable_controls)
         except Exception as e:
             log_message(f"_deferred_executables_check error: {e}")
@@ -1021,23 +1362,13 @@ class ClipsterApp:
 
 
     def _show_window_after_setup(self):
-        """Show the window with a smooth fade-in after initial setup."""
-        self.root.attributes("-alpha", 0.0)
+        """Show the window after initial setup to reduce flashing."""
+        # Window styles were already applied in _create_titlebar()
+        # Just show the window now
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
         self.root.update_idletasks()
-        self._fade_in_window()
-
-    def _fade_in_window(self, alpha=0.0):
-        """Incrementally increase window opacity for a fade-in effect (~200ms)."""
-        alpha = min(alpha + 0.07, 1.0)
-        try:
-            self.root.attributes("-alpha", alpha)
-        except Exception:
-            return
-        if alpha < 1.0:
-            self.root.after(15, lambda: self._fade_in_window(alpha))
 
     def _create_titlebar(self):
         """Create a modern custom titlebar with Windows 11 styling."""
@@ -1085,7 +1416,7 @@ class ClipsterApp:
         # Re-affirm AppUserModelID now that we have an HWND, ensuring the
         # taskbar groups this window under Clipster (not python.exe)
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Clipster.App.1.3")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Clipster.App.1.3.1")
         except Exception:
             pass
 
@@ -1098,7 +1429,7 @@ class ClipsterApp:
             pass
 
         # Titlebar frame — taller for breathing room
-        self.titlebar_frame = ctk.CTkFrame(self.root, height=38, corner_radius=0)
+        self.titlebar_frame = ctk.CTkFrame(self.root, height=42, corner_radius=0)
         self.titlebar_frame.pack(fill="x", side="top")
         self.titlebar_frame.pack_propagate(False)
         self._update_titlebar_theme()
@@ -1133,10 +1464,10 @@ class ClipsterApp:
         self._version_badge = ctk.CTkLabel(
             left, text=f"v{APP_VERSION}",
             font=ctk.CTkFont(size=10),
-            fg_color=ACCENT_COLOR, corner_radius=4,
-            width=42, height=18, text_color="white"
+            fg_color=ACCENT_COLOR, corner_radius=6,
+            width=46, height=20, text_color="white"
         )
-        self._version_badge.pack(side="left", padx=(0, 8))
+        self._version_badge.pack(side="left", padx=(0, 10))
 
         self._subtitle_lbl = ctk.CTkLabel(
             left, text=SPLASH_TEXT,
@@ -1157,25 +1488,25 @@ class ClipsterApp:
         btns.pack(side="right", pady=4, padx=(0, 6))
 
         self._min_btn = ctk.CTkButton(
-            btns, text="—", width=32, height=28, corner_radius=6,
+            btns, text="—", width=36, height=30, corner_radius=7,
             fg_color="transparent", hover_color="#3A3A3A",
-            font=ctk.CTkFont(size=12),
+            font=ctk.CTkFont(size=13),
             command=self._minimize_window
         )
         self._min_btn.pack(side="left", padx=2)
 
         self._max_btn = ctk.CTkButton(
-            btns, text="□", width=32, height=28, corner_radius=6,
+            btns, text="□", width=36, height=30, corner_radius=7,
             fg_color="transparent", hover_color="#3A3A3A",
-            font=ctk.CTkFont(size=12),
+            font=ctk.CTkFont(size=13),
             command=self._toggle_max_restore
         )
         self._max_btn.pack(side="left", padx=2)
 
         self._close_btn = ctk.CTkButton(
-            btns, text="✕", width=32, height=28, corner_radius=6,
+            btns, text="✕", width=36, height=30, corner_radius=7,
             fg_color="transparent", hover_color="#C42B1C",
-            font=ctk.CTkFont(size=12),
+            font=ctk.CTkFont(size=13),
             command=self._close_window
         )
         self._close_btn.pack(side="left", padx=2)
@@ -1282,28 +1613,15 @@ class ClipsterApp:
         self.root.iconify()
 
     def _close_window(self):
-        """Close the window with a smooth fade-out effect (~150ms)."""
-        self._fade_out_and_close()
-
-    def _fade_out_and_close(self, alpha=1.0):
-        """Incrementally decrease window opacity then destroy."""
-        alpha = max(alpha - 0.1, 0.0)
         try:
-            self.root.attributes("-alpha", alpha)
+            self.graceful_shutdown()
         except Exception:
             pass
-        if alpha > 0.0:
-            self.root.after(15, lambda: self._fade_out_and_close(alpha))
-        else:
-            try:
-                self.graceful_shutdown()
-            except Exception:
-                pass
-            try:
-                self.root.quit()
-                self.root.destroy()
-            except Exception:
-                pass
+        try:
+            self.root.quit()
+            self.root.destroy()
+        except Exception:
+            pass
 
     def graceful_shutdown(self):
         """Safely shut down downloads, background workers, and temp files."""
@@ -1414,65 +1732,141 @@ class ClipsterApp:
         except Exception:
             pass
 
-    def _show_custom_dropdown(self, parent_widget, values, on_select):
-        """Show custom dropdown menu."""
+    def _make_menu_window(self, x, y, width=0):
+        """Create and style a floating menu window (shared by dropdown + context menu)."""
         import ctypes
+        theme = self.settings.get("theme", "dark")
+        is_dark = theme != "light"
 
         menu_win = ctk.CTkToplevel(self.root)
         menu_win.overrideredirect(True)
         menu_win.attributes("-topmost", True)
         menu_win.wm_attributes("-alpha", 0.0)
-        theme = self.settings["theme"]
-        fg_color = "#f9f9f9" if theme == "light" else "#1f1f1f"
-        hover_color = "#e0e0e0" if theme == "light" else "#2b2b2b"
-        menu_win.configure(fg_color=fg_color)
 
-        # Rounded corners
+        # Card colours
+        bg     = "#18181f" if is_dark else "#ffffff"
+        border = "#2e2e3e" if is_dark else "#d0d0d8"
+
+        # Outer border frame acts as the 1 px card border
+        border_frame = ctk.CTkFrame(menu_win, fg_color=border, corner_radius=12)
+        border_frame.pack(fill="both", expand=True, padx=0, pady=0)
+
+        inner = ctk.CTkFrame(border_frame, fg_color=bg, corner_radius=11)
+        inner.pack(fill="both", expand=True, padx=1, pady=1)
+
+        menu_win.configure(fg_color=bg)
+
+        # Windows 11 rounded corners
         try:
             hwnd = ctypes.windll.user32.GetParent(menu_win.winfo_id())
-            DWMWA_WINDOW_CORNER_PREFERENCE = 33
-            DWMWCP_ROUND = 2
             ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, ctypes.byref(ctypes.c_int(DWMWCP_ROUND)), ctypes.sizeof(ctypes.c_int)
+                hwnd, 33, ctypes.byref(ctypes.c_int(2)), ctypes.sizeof(ctypes.c_int)
             )
         except Exception:
             pass
 
-        # Position below parent
+        if width:
+            menu_win.geometry(f"{width}+{x}+{y}")
+        else:
+            menu_win.geometry(f"+{x}+{y}")
+
+        return menu_win, inner, is_dark, bg
+
+    def _add_menu_item(self, parent, label, command, is_dark, width=0, is_danger=False):
+        """Add a polished menu item row with icon, text, and hover accent."""
+        theme_text   = "#f0f0f0" if is_dark else "#1a1a1a"
+        hover_bg     = "#252535" if is_dark else "#f0f0f8"
+        danger_text  = DANGER_COLOR
+        text_color   = danger_text if is_danger else theme_text
+
+        # Detect separator
+        if label == "---":
+            sep = ctk.CTkFrame(parent, height=1, fg_color="#2e2e3e" if is_dark else "#e0e0e8",
+                               corner_radius=0)
+            sep.pack(fill="x", padx=10, pady=4)
+            return
+
+        row = ctk.CTkFrame(parent, fg_color="transparent", cursor="hand2", corner_radius=8)
+        if width:
+            row.pack(fill="x", padx=6, pady=1)
+        else:
+            row.pack(fill="x", padx=6, pady=1)
+
+        # Left accent bar (hidden by default, shown on hover)
+        accent = ctk.CTkFrame(row, width=3, corner_radius=2,
+                              fg_color=DANGER_COLOR if is_danger else ACCENT_COLOR)
+        accent.pack(side="left", fill="y", padx=(0, 0), pady=4)
+        accent.pack_forget()
+
+        lbl = ctk.CTkLabel(
+            row, text=f"  {label}",
+            anchor="w",
+            font=ctk.CTkFont(size=12),
+            text_color=text_color,
+            height=32,
+            padx=6,
+        )
+        lbl.pack(side="left", fill="x", expand=True)
+
+        def on_enter(e):
+            row.configure(fg_color=hover_bg)
+            accent.pack(side="left", fill="y", padx=(0, 0), pady=4, before=lbl)
+
+        def on_leave(e):
+            row.configure(fg_color="transparent")
+            accent.pack_forget()
+
+        def on_click(e):
+            try:
+                command()
+            except Exception:
+                pass
+
+        for w in (row, lbl):
+            w.bind("<Enter>", on_enter)
+            w.bind("<Leave>", on_leave)
+            w.bind("<Button-1>", on_click)
+
+    def _animate_menu_in(self, menu_win, steps=8, target=0.97):
+        """Fade + subtle scale-in animation for menu windows."""
+        def step(i=0):
+            try:
+                if not menu_win.winfo_exists():
+                    return
+                progress = i / steps
+                ease = 1 - (1 - progress) ** 2
+                alpha = target * ease
+                menu_win.wm_attributes("-alpha", min(alpha, target))
+                if i < steps:
+                    menu_win.after(12, lambda: step(i + 1))
+            except Exception:
+                pass
+        menu_win.after(10, lambda: step(0))
+
+    def _show_custom_dropdown(self, parent_widget, values, on_select):
+        """Show a polished custom dropdown below parent_widget."""
         x = parent_widget.winfo_rootx()
-        y = parent_widget.winfo_rooty() + parent_widget.winfo_height()
-        menu_win.geometry(f"+{x}+{y}")
+        y = parent_widget.winfo_rooty() + parent_widget.winfo_height() + 2
+        w = max(parent_widget.winfo_width(), 160)
 
-        # Add buttons
+        menu_win, inner, is_dark, _ = self._make_menu_window(x, y)
+
+        # Padding top
+        ctk.CTkFrame(inner, height=4, fg_color="transparent").pack()
+
         for val in values:
-            btn = ctk.CTkButton(
-                menu_win, 
-                text=val, 
-                fg_color="transparent", 
-                hover_color=hover_color, 
-                anchor="w",
-                width=parent_widget.winfo_width() - 8, 
-                height=32, 
-                corner_radius=8,  # ADD corner_radius=8
-                command=lambda v=val: (on_select(v), menu_win.destroy())
-            )
-            btn.pack(fill="x", padx=6, pady=2)
+            def make_cmd(v=val):
+                def cmd():
+                    try:
+                        menu_win.destroy()
+                    except Exception:
+                        pass
+                    on_select(v)
+                return cmd
+            self._add_menu_item(inner, val, make_cmd(), is_dark, width=w)
 
-        
-
-        # Fade in
-        alpha_step = 0.08
-        current_alpha = 0.0
-        def fade_in():
-            nonlocal current_alpha
-            if current_alpha < 0.96:
-                current_alpha += alpha_step
-                menu_win.attributes("-alpha", min(current_alpha, 0.96))
-                menu_win.after(20, fade_in)
-            else:
-                menu_win.attributes("-alpha", 0.96)
-
-        menu_win.after(10, fade_in)
+        # Padding bottom
+        ctk.CTkFrame(inner, height=4, fg_color="transparent").pack()
 
         # Close on focus out
         def close_on_focus_out(e=None):
@@ -1480,76 +1874,62 @@ class ClipsterApp:
                 menu_win.destroy()
             except Exception:
                 pass
-
         menu_win.bind("<FocusOut>", close_on_focus_out)
+        menu_win.update_idletasks()
         menu_win.focus_force()
+        self._animate_menu_in(menu_win)
 
     def _show_custom_menu(self, event, items):
-        """Show custom context menu."""
-        import ctypes
+        """Show a polished right-click context menu at the cursor."""
+        x, y = event.x_root + 4, event.y_root + 4
 
-        menu_win = ctk.CTkToplevel(self.root)
-        menu_win.overrideredirect(True)
-        menu_win.attributes("-topmost", True)
-        theme = self.settings["theme"]
-        fg_color = "#f9f9f9" if theme == "light" else "#1f1f1f"
-        hover_color = "#e0e0e0" if theme == "light" else "#2b2b2b"
-        menu_win.configure(fg_color=fg_color)
-        menu_win.wm_attributes("-alpha", 0.96)
+        menu_win, inner, is_dark, _ = self._make_menu_window(x, y)
 
-        # Rounded corners
-        try:
-            hwnd = ctypes.windll.user32.GetParent(menu_win.winfo_id())
-            DWMWA_WINDOW_CORNER_PREFERENCE = 33
-            DWMWCP_ROUND = 2
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, ctypes.byref(ctypes.c_int(DWMWCP_ROUND)), ctypes.sizeof(ctypes.c_int)
-            )
-        except Exception:
-            pass
+        # Padding top
+        ctk.CTkFrame(inner, height=4, fg_color="transparent").pack()
 
-        # Add items
-        for label, callback in items:
-            btn = ctk.CTkButton(
-                menu_win, 
-                text=label, 
-                fg_color="transparent", 
-                hover_color=hover_color, 
-                anchor="w",
-                width=180, 
-                height=32, 
-                corner_radius=8,  # ADD corner_radius=8
-                command=lambda c=callback, 
-                m=menu_win: (m.destroy(), c())
-            )
-            btn.pack(fill="x", padx=8, pady=2)
+        for entry in items:
+            # Support ("---",) as a divider shorthand
+            if entry[0] == "---":
+                self._add_menu_item(inner, "---", None, is_dark)
+                continue
+            label, callback = entry[0], entry[1]
+            is_danger = any(k in label.lower() for k in ("remove", "delete", "clear"))
 
-        # Position at mouse
-        x, y = event.x_root, event.y_root
-        menu_win.geometry(f"+{x}+{y}")
+            def make_cmd(cb=callback):
+                def cmd():
+                    try:
+                        menu_win.destroy()
+                    except Exception:
+                        pass
+                    try:
+                        cb()
+                    except Exception:
+                        pass
+                return cmd
+            self._add_menu_item(inner, label, make_cmd(), is_dark, is_danger=is_danger)
 
-        # Close on focus out
-        def close_on_focus_out(e=None):
+        # Padding bottom
+        ctk.CTkFrame(inner, height=4, fg_color="transparent").pack()
+
+        # Close on focus out or Escape
+        def close(e=None):
             try:
                 menu_win.destroy()
             except Exception:
                 pass
-
-        menu_win.bind("<FocusOut>", close_on_focus_out)
+        menu_win.bind("<FocusOut>", close)
+        menu_win.bind("<Escape>", close)
+        menu_win.update_idletasks()
         menu_win.focus_force()
+        self._animate_menu_in(menu_win)
 
     def _build_ui(self):
-        """Populate tab contents (called after skeleton UI is visible)."""
+        """Initialize global UI state. Tab content is built lazily on first visit."""
         try:
-            self._build_download_tab(self.tabs.tab("Download"))
-            self._build_history_tab(self.tabs.tab("History"))
-            self._build_settings_tab(self.tabs.tab("Settings"))
-            self._build_update_tab(self.tabs.tab("Update"))
-
             self.status_var = None
             self.cancel_btn = None
             self.spinner_overlay = None
-
         except Exception as e:
             log_message(f"_build_ui error: {e}")
 
@@ -1564,24 +1944,24 @@ class ClipsterApp:
 
         # ── URL input row ──────────────────────────────────────────────
         url_bar = ctk.CTkFrame(frame, fg_color="transparent")
-        url_bar.pack(fill="x", padx=8, pady=(10, 4))
+        url_bar.pack(fill="x", padx=10, pady=(12, 6))
         self.dl_url_entry = ctk.CTkEntry(
-            url_bar, placeholder_text="Paste a YouTube URL and press Enter or click Add",
-            height=38, corner_radius=8
+            url_bar, placeholder_text="Paste a YouTube URL and press Enter or click Add ↵",
+            height=42, corner_radius=10, font=ctk.CTkFont(size=13)
         )
         self.dl_url_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
         self.dl_url_entry.bind("<Return>", lambda e: self._dl_add_url())
         ctk.CTkButton(
-            url_bar, text="Add", fg_color=ACCENT_COLOR,
-            width=80, height=38, corner_radius=8,
+            url_bar, text="Add  +", fg_color=ACCENT_COLOR, hover_color=ACCENT_HOVER,
+            width=90, height=42, corner_radius=10, font=ctk.CTkFont(size=13, weight="bold"),
             command=self._dl_add_url
         ).pack(side="left")
 
         # ── Queue list ─────────────────────────────────────────────────
-        ctk.CTkLabel(frame, text="Download Queue:", anchor="w",
-                     font=ctk.CTkFont(size=12)).pack(anchor="w", padx=10, pady=(6, 2))
-        self.dl_queue_scroll = ctk.CTkScrollableFrame(frame, corner_radius=10)
-        self.dl_queue_scroll.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+        ctk.CTkLabel(frame, text="Download Queue", anchor="w",
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=12, pady=(8, 4))
+        self.dl_queue_scroll = ctk.CTkScrollableFrame(frame, corner_radius=12)
+        self.dl_queue_scroll.pack(fill="both", expand=True, padx=10, pady=(0, 4))
 
         self._dl_empty_label = ctk.CTkLabel(
             self.dl_queue_scroll,
@@ -1597,7 +1977,7 @@ class ClipsterApp:
 
         self.dl_overall_progress = ctk.CTkProgressBar(
             summary, height=8, corner_radius=4,
-            fg_color="#2E2E2E", progress_color=ACCENT_COLOR
+            fg_color="#1E1E2E", progress_color=ACCENT_COLOR
         )
         self.dl_overall_progress.set(0)
         self.dl_overall_progress.grid(row=0, column=0, columnspan=3, sticky="ew",
@@ -1616,17 +1996,17 @@ class ClipsterApp:
         self.dl_speed_lbl.grid(row=1, column=2, sticky="e", padx=(0, 10), pady=(0, 6))
 
         # ── Bottom controls row ────────────────────────────────────────
-        ctrl = ctk.CTkFrame(frame, corner_radius=10)
-        ctrl.pack(fill="x", padx=8, pady=(0, 8))
+        ctrl = ctk.CTkFrame(frame, corner_radius=12)
+        ctrl.pack(fill="x", padx=10, pady=(0, 10))
 
         ctk.CTkButton(
-            ctrl, text="Clear All", fg_color="gray",
-            width=90, height=34, corner_radius=8,
+            ctrl, text="Clear All", fg_color="#4B4B4B", hover_color="#5A5A5A",
+            width=100, height=38, corner_radius=10,
             command=self._dl_clear_all
-        ).pack(side="right", padx=(4, 10))
+        ).pack(side="right", padx=(4, 12))
         self.dl_download_btn = ctk.CTkButton(
-            ctrl, text="⏬  Download All", fg_color=ACCENT_COLOR,
-            width=140, height=34, corner_radius=8,
+            ctrl, text="⏬  Download All", fg_color=ACCENT_COLOR, hover_color=ACCENT_HOVER,
+            width=160, height=38, corner_radius=10, font=ctk.CTkFont(size=13, weight="bold"),
             command=self._dl_start_all
         )
         self.dl_download_btn.pack(side="right", padx=4)
@@ -1673,6 +2053,7 @@ class ClipsterApp:
             "_progress_bar": None,
             "_speed_lbl":    None,
             "_size_lbl":     None,
+            "_cancel_flag":  threading.Event(),   # set to abort this item's download
         }
 
         with self._dl_queue_lock:
@@ -1897,6 +2278,7 @@ class ClipsterApp:
                 "_size_lbl":     None,
                 "_progress_pct": 0.0,
                 "_speed_text":   "",
+                "_cancel_flag":  threading.Event(),
             }
             with self._dl_queue_lock:
                 self._dl_queue.append(q_entry)
@@ -2003,46 +2385,47 @@ class ClipsterApp:
         is_audio = entry.get("selected_fmt", "mp4") in ("mp3", "m4a")
         is_downloading = status == "downloading"
 
-        row = ctk.CTkFrame(self.dl_queue_scroll, corner_radius=8)
-        row.pack(fill="x", padx=4, pady=3)
+        row = ctk.CTkFrame(self.dl_queue_scroll, corner_radius=10)
+        row.pack(fill="x", padx=4, pady=4)
         row.grid_columnconfigure(1, weight=1)
 
         # ── Line 1: badge  title  remove ──────────────────────────────
         badge_color, badge_text = {
-            "pending":     ("#444444", "⏺ Pending"),
-            "fetching":    ("#555555", "⏳ Fetching"),
-            "ready":       ("#1a7a3f", "✔ Ready"),
-            "downloading": (ACCENT_COLOR, "⬇ Downloading"),
-            "done":        ("#1a7a3f", "✅ Done"),
-            "error":       ("#b22222", "✖ Error"),
-        }.get(status, ("#555555", status))
+            "pending":     ("#3A3A4A", "⏺  Pending"),
+            "fetching":    ("#2D3748", "⏳  Fetching"),
+            "ready":       ("#14532D", "✔  Ready"),
+            "downloading": (ACCENT_COLOR, "⬇  Downloading"),
+            "done":        (SUCCESS_COLOR, "✅  Done"),
+            "error":       (DANGER_COLOR,  "✖  Error"),
+        }.get(status, ("#3A3A4A", status))
 
         status_lbl = ctk.CTkLabel(
-            row, text=badge_text, width=110, height=24,
-            fg_color=badge_color, corner_radius=6,
-            font=ctk.CTkFont(size=11)
+            row, text=badge_text, width=120, height=26,
+            fg_color=badge_color, corner_radius=7,
+            font=ctk.CTkFont(size=11, weight="bold")
         )
-        status_lbl.grid(row=0, column=0, padx=(8, 6), pady=(8, 2), sticky="w")
+        status_lbl.grid(row=0, column=0, padx=(10, 8), pady=(10, 4), sticky="w")
         entry["_status_lbl"] = status_lbl
 
         title_text = truncate_text(entry.get("title", entry["url"]), 75)
         if status == "error":
-            title_text = f"✖ {entry.get('error', 'Failed')}"
+            raw_err = entry.get("error", "Download failed.")
+            title_text = "✖  " + truncate_text(sanitize_ytdlp_error(raw_err), 70)
         title_lbl = ctk.CTkLabel(
             row, text=title_text, anchor="w",
-            font=ctk.CTkFont(size=12, weight="bold")
+            font=ctk.CTkFont(size=13, weight="bold")
         )
-        title_lbl.grid(row=0, column=1, sticky="w", padx=(0, 4), pady=(8, 2))
+        title_lbl.grid(row=0, column=1, sticky="w", padx=(0, 4), pady=(10, 4))
         entry["_title_lbl"] = title_lbl
 
         def make_remove(idx=i):
             return lambda: self._dl_remove_item(idx)
         ctk.CTkButton(
-            row, text="✕", width=26, height=26,
-            fg_color="transparent", hover_color="#8B0000",
-            corner_radius=6, font=ctk.CTkFont(size=12),
+            row, text="✕", width=28, height=28,
+            fg_color="transparent", hover_color=DANGER_COLOR,
+            corner_radius=7, font=ctk.CTkFont(size=13),
             command=make_remove()
-        ).grid(row=0, column=2, padx=(0, 8), pady=(8, 2))
+        ).grid(row=0, column=2, padx=(0, 10), pady=(10, 4))
 
         # ── Line 2: meta  res-combo  size ─────────────────────────────
         meta_frame = ctk.CTkFrame(row, fg_color="transparent")
@@ -2099,7 +2482,7 @@ class ClipsterApp:
             size_lbl.pack(side="left")
             entry["_size_lbl"] = size_lbl
 
-        # ── Line 3: per-item progress bar + speed/ETA (only while downloading) ──
+        # ── Line 3: per-item progress bar + speed/ETA + cancel (only while downloading) ──
         if is_downloading:
             prog_frame = ctk.CTkFrame(row, fg_color="transparent")
             prog_frame.grid(row=2, column=0, columnspan=3, sticky="ew",
@@ -2107,7 +2490,7 @@ class ClipsterApp:
 
             pbar = ctk.CTkProgressBar(
                 prog_frame, height=6, corner_radius=3,
-                fg_color="#2E2E2E", progress_color=ACCENT_COLOR
+                fg_color="#1E1E2E", progress_color=ACCENT_COLOR
             )
             pbar.set(entry.get("_progress_pct", 0.0))
             pbar.pack(side="left", fill="x", expand=True, padx=(0, 8))
@@ -2115,10 +2498,28 @@ class ClipsterApp:
 
             speed_lbl = ctk.CTkLabel(
                 prog_frame, text=entry.get("_speed_text", ""),
-                font=ctk.CTkFont(size=10), text_color="#aaaaaa", width=120, anchor="e"
+                font=ctk.CTkFont(size=10), text_color="#aaaaaa", width=100, anchor="e"
             )
-            speed_lbl.pack(side="right")
+            speed_lbl.pack(side="left", expand=False)
             entry["_speed_lbl"] = speed_lbl
+
+            # Per-item cancel button
+            def make_cancel_item(e=entry):
+                def _do_cancel():
+                    cancel_flag = e.get("_cancel_flag")
+                    if cancel_flag:
+                        cancel_flag.set()
+                    self.download_proc.cancel()
+                    _toast(self, f"Cancelling: {truncate_text(e.get('title', ''), 40)}", level="error")
+                return _do_cancel
+
+            ctk.CTkButton(
+                prog_frame, text="✕ Cancel", width=76, height=22,
+                fg_color="#3A1515", hover_color=DANGER_COLOR,
+                corner_radius=6, font=ctk.CTkFont(size=10, weight="bold"),
+                text_color="#F87171",
+                command=make_cancel_item()
+            ).pack(side="right", padx=(6, 0))
         else:
             entry["_progress_bar"] = None
             entry["_speed_lbl"]    = None
@@ -2203,6 +2604,11 @@ class ClipsterApp:
         def dl_task():
             completed = 0
             for queue_idx, entry in items:
+                # Reset cancel flag for this item before starting
+                cancel_flag = entry.get("_cancel_flag")
+                if cancel_flag:
+                    cancel_flag.clear()
+
                 fmt_selector = entry.get("fmt_selector") or global_selector
 
                 # Flip status → downloading (triggers full row rebuild with progress bar)
@@ -2227,7 +2633,7 @@ class ClipsterApp:
                     _ev.set()
 
                 def error_cb(err, _r=result, _ev=finished_event):
-                    _r["error"] = err
+                    _r["error"] = sanitize_ytdlp_error(err)
                     _ev.set()
 
                 self.download_proc.start_download(
@@ -2237,9 +2643,19 @@ class ClipsterApp:
                 )
 
                 while not finished_event.is_set():
+                    # Check per-item cancel flag
+                    if cancel_flag and cancel_flag.is_set():
+                        self.download_proc.cancel()
+                        finished_event.wait(timeout=2)
+                        break
                     time.sleep(0.25)
 
-                if result["error"]:
+                cancelled = cancel_flag and cancel_flag.is_set()
+
+                if cancelled:
+                    entry["_progress_pct"] = 0.0
+                    self.ui_queue.put(("dl_item_status", queue_idx, "error", "Cancelled by user"))
+                elif result["error"]:
                     entry["_progress_pct"] = 0.0
                     self.ui_queue.put(("dl_item_status", queue_idx, "error", result["error"]))
                 else:
@@ -2349,8 +2765,8 @@ class ClipsterApp:
         search_frame = ctk.CTkFrame(top, fg_color="transparent")
         search_frame.pack(side="left", fill="x", expand=True, padx=(6, 8), pady=6)
         self.history_search_entry = ctk.CTkEntry(
-            search_frame, placeholder_text="Search history...",
-            height=36, corner_radius=8
+            search_frame, placeholder_text="🔍  Search by title or uploader...",
+            height=38, corner_radius=10, font=ctk.CTkFont(size=13)
         )
         self.history_search_entry.pack(fill="x", expand=True)
         self.history_search_entry.bind("<KeyRelease>", self._on_history_search)
@@ -2363,21 +2779,21 @@ class ClipsterApp:
             text="⟳  Refresh",
             command=self.refresh_history,
             fg_color=SECONDARY_COLOR,
-            hover_color="#009aA8",
-            height=34,
+            hover_color=SECONDARY_HOVER,
+            height=36,
             width=110,
-            corner_radius=8,
+            corner_radius=10,
             font=ctk.CTkFont(size=12, weight="bold"),
         ).pack(side="left", padx=(0, 6))
         ctk.CTkButton(
             btn_frame,
             text="🗑  Clear All",
             command=self.clear_history_prompt,
-            fg_color="#C0392B",
-            hover_color="#96281B",
-            height=34,
+            fg_color=DANGER_COLOR,
+            hover_color="#B91C1C",
+            height=36,
             width=110,
-            corner_radius=8,
+            corner_radius=10,
             font=ctk.CTkFont(size=12, weight="bold"),
         ).pack(side="left")
 
@@ -2426,7 +2842,7 @@ class ClipsterApp:
 
     def _create_history_row(self, idx, entry):
         """Create a row for history item."""
-        row_frame = ctk.CTkFrame(self.history_scroll, height=100, corner_radius=10)
+        row_frame = ctk.CTkFrame(self.history_scroll, height=80, corner_radius=12)
         row_frame.grid_columnconfigure(1, weight=1)
 
         title = entry.get("title", "<No title>")
@@ -2441,44 +2857,42 @@ class ClipsterApp:
             info_text = f"{uploader} • {fmt} {res} • {date}"
         row_frame.grid_columnconfigure(0, weight=1)
         title_lbl = ctk.CTkLabel(row_frame, text=title, anchor="w", font=ctk.CTkFont(size=13, weight="bold"))
-        title_lbl.grid(row=0, column=0, sticky="w", padx=(10,8), pady=(8,0))
-        info_lbl = ctk.CTkLabel(row_frame, text=info_text, anchor="w", font=ctk.CTkFont(size=10))
-        info_lbl.grid(row=1, column=0, sticky="w", padx=(10,8), pady=(0,8))
+        title_lbl.grid(row=0, column=0, sticky="w", padx=(12, 8), pady=(10, 0))
+        info_lbl = ctk.CTkLabel(row_frame, text=info_text, anchor="w",
+                                font=ctk.CTkFont(size=11), text_color="#888888")
+        info_lbl.grid(row=1, column=0, sticky="w", padx=(12, 8), pady=(0, 10))
 
         # Buttons
-        theme = self.settings.get("theme", "dark")
-        hover_color = "#e0e0e0" if theme == "light" else "#3A3A3A"
-        btn_bg = "#2B2B2B" if theme == "dark" else "#E8E8E8"
         btns = ctk.CTkFrame(row_frame, fg_color="transparent")
-        btns.grid(row=0, column=1, rowspan=2, padx=(4, 10), pady=4)
+        btns.grid(row=0, column=1, rowspan=2, padx=(4, 12), pady=4)
 
         # Open in browser button
         open_btn = ctk.CTkButton(
             btns, text="🌐  Open",
-            width=72, height=30, corner_radius=6,
-            fg_color="#1E6B3C", hover_color="#175430",
-            font=ctk.CTkFont(size=11),
+            width=78, height=32, corner_radius=8,
+            fg_color=SUCCESS_COLOR, hover_color="#15803D",
+            font=ctk.CTkFont(size=11, weight="bold"),
             command=lambda: self._history_open_in_browser(entry),
         )
-        open_btn.pack(side="left", padx=(0, 4))
+        open_btn.pack(side="left", padx=(0, 5))
 
         # Copy URL button
         copy_btn = ctk.CTkButton(
-            btns, text="📋  Copy URL",
-            width=90, height=30, corner_radius=6,
-            fg_color="#6B3FA0", hover_color="#552F80",
-            font=ctk.CTkFont(size=11),
+            btns, text="📋  Copy",
+            width=80, height=32, corner_radius=8,
+            fg_color="#7C3AED", hover_color="#6D28D9",
+            font=ctk.CTkFont(size=11, weight="bold"),
             command=lambda: self._history_copy_url(entry),
         )
-        copy_btn.pack(side="left", padx=(0, 4))
+        copy_btn.pack(side="left", padx=(0, 5))
 
         # Delete button
         del_btn = ctk.CTkButton(
             btns, text="✕",
-            width=30, height=30, corner_radius=6,
-            fg_color="transparent", hover_color="#C0392B",
-            font=ctk.CTkFont(size=13, weight="bold"),
-            text_color="#E74C3C",
+            width=32, height=32, corner_radius=8,
+            fg_color="#3F1515", hover_color=DANGER_COLOR,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color="#F87171",
             command=lambda: self._delete_history_entry(idx),
         )
         del_btn.pack(side="left")
@@ -2541,57 +2955,236 @@ class ClipsterApp:
         frame = ctk.CTkFrame(parent, corner_radius=12)
         frame.pack(fill="both", expand=True, padx=12, pady=12)
 
-        title = ctk.CTkLabel(frame, text="Check for Updates", font=ctk.CTkFont(size=18, weight="bold"))
-        title.pack(pady=(10, 4))
+        # ── Clipster app update section ────────────────────────────────
+        ctk.CTkLabel(frame, text="Clipster App", font=ctk.CTkFont(size=18, weight="bold")).pack(pady=(16, 4))
 
         self.update_status_label = ctk.CTkLabel(frame, text="Checking for updates...", wraplength=480)
-        self.update_status_label.pack(pady=8)
+        self.update_status_label.pack(pady=6)
 
-        btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
-        btn_frame.pack(pady=14)
+        app_btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        app_btn_frame.pack(pady=10)
 
         self.update_check_btn = ctk.CTkButton(
-            btn_frame,
+            app_btn_frame,
             text="⟳  Recheck",
             fg_color=ACCENT_COLOR,
-            hover_color="#005fa3",
-            height=36,
-            width=130,
-            corner_radius=8,
+            hover_color=ACCENT_HOVER,
+            height=38,
+            width=140,
+            corner_radius=10,
             font=ctk.CTkFont(size=13, weight="bold"),
             command=self._check_update_button,
         )
         self.update_check_btn.pack(side="left", padx=6)
 
         self.update_download_btn = ctk.CTkButton(
-            btn_frame,
+            app_btn_frame,
             text="⬇️  Download & Install",
             fg_color=SECONDARY_COLOR,
-            hover_color="#009aA8",
-            height=36,
-            width=180,
-            corner_radius=8,
+            hover_color=SECONDARY_HOVER,
+            height=38,
+            width=190,
+            corner_radius=10,
             font=ctk.CTkFont(size=13, weight="bold"),
             command=self._download_and_install_update,
         )
         self.update_download_btn.pack(side="left", padx=6)
 
         self.update_open_btn = ctk.CTkButton(
-            btn_frame,
+            app_btn_frame,
             text="🌐  GitHub Releases",
-            fg_color="#555555",
-            hover_color="#404040",
-            height=36,
-            width=155,
-            corner_radius=8,
+            fg_color="#4B4B4B",
+            hover_color="#5A5A5A",
+            height=38,
+            width=160,
+            corner_radius=10,
             font=ctk.CTkFont(size=13),
             command=lambda: webbrowser.open(GITHUB_RELEASES_URL),
         )
         self.update_open_btn.pack(side="left", padx=6)
 
-        # Check for updates on load
-        threading.Thread(target=self._check_for_updates, daemon=True).start()
+        # ── Divider ────────────────────────────────────────────────────
+        ctk.CTkFrame(frame, height=1, fg_color="#2D2D3A").pack(fill="x", padx=24, pady=(20, 0))
 
+        # ── yt-dlp updater section ─────────────────────────────────────
+        ctk.CTkLabel(frame, text="yt-dlp Downloader Engine",
+                     font=ctk.CTkFont(size=15, weight="bold")).pack(pady=(16, 4))
+
+        ytdlp_desc = ctk.CTkLabel(
+            frame,
+            text="yt-dlp releases updates frequently to fix broken downloads. Click below to fetch and replace yt-dlp.exe in your Assets folder.",
+            wraplength=500, justify="center", text_color="#AAAAAA",
+            font=ctk.CTkFont(size=12),
+        )
+        ytdlp_desc.pack(pady=(0, 6))
+
+        self.ytdlp_status_label = ctk.CTkLabel(
+            frame, text="", wraplength=500,
+            font=ctk.CTkFont(size=12), text_color="#AAAAAA"
+        )
+        self.ytdlp_status_label.pack(pady=(0, 4))
+
+        self.ytdlp_progress = ctk.CTkProgressBar(
+            frame, height=6, corner_radius=3,
+            fg_color="#1E1E2E", progress_color=SECONDARY_COLOR, width=400
+        )
+        self.ytdlp_progress.set(0)
+        # Hidden until download starts
+        self._ytdlp_progress_visible = False
+
+        ytdlp_btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        ytdlp_btn_frame.pack(pady=8)
+
+        self.ytdlp_update_btn = ctk.CTkButton(
+            ytdlp_btn_frame,
+            text="⬇️  Update yt-dlp",
+            fg_color=SECONDARY_COLOR,
+            hover_color=SECONDARY_HOVER,
+            height=38,
+            width=180,
+            corner_radius=10,
+            font=ctk.CTkFont(size=13, weight="bold"),
+            command=self._update_ytdlp,
+        )
+        self.ytdlp_update_btn.pack(side="left", padx=6)
+
+        ctk.CTkButton(
+            ytdlp_btn_frame,
+            text="🌐  yt-dlp Releases",
+            fg_color="#4B4B4B",
+            hover_color="#5A5A5A",
+            height=38,
+            width=155,
+            corner_radius=10,
+            font=ctk.CTkFont(size=13),
+            command=lambda: webbrowser.open("https://github.com/yt-dlp/yt-dlp/releases"),
+        ).pack(side="left", padx=6)
+
+        # Check for Clipster app updates on load
+        threading.Thread(target=self._check_for_updates, daemon=True).start()
+        # Show current yt-dlp version if exe exists
+        self.root.after(200, self._show_ytdlp_current_version)
+
+
+    def _show_ytdlp_current_version(self):
+        """Read the version string from the local yt-dlp.exe and show it."""
+        try:
+            lbl = getattr(self, "ytdlp_status_label", None)
+            if not lbl:
+                return
+            if not YT_DLP_EXE.exists():
+                lbl.configure(text="yt-dlp.exe not found in Assets/", text_color=DANGER_COLOR)
+                return
+            result = run_subprocess_safe([str(YT_DLP_EXE), "--version"], timeout=8)
+            ver = (result.get("stdout") or "").strip()
+            if ver:
+                lbl.configure(text=f"Installed version: {ver}", text_color="#AAAAAA")
+            else:
+                lbl.configure(text="Could not read yt-dlp version.", text_color="#AAAAAA")
+        except Exception as e:
+            log_message(f"_show_ytdlp_current_version error: {e}")
+
+    def _update_ytdlp(self):
+        """Download the latest yt-dlp.exe from GitHub and replace the one in Assets/."""
+        import requests
+
+        btn = getattr(self, "ytdlp_update_btn", None)
+        status_lbl = getattr(self, "ytdlp_status_label", None)
+        progress_bar = getattr(self, "ytdlp_progress", None)
+
+        if btn:
+            btn.configure(state="disabled", text="Updating...")
+
+        YTDLP_API = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest"
+
+        def _do_update():
+            try:
+                # Show progress bar
+                def _show_bar():
+                    try:
+                        if progress_bar:
+                            progress_bar.pack(pady=(0, 8))
+                            progress_bar.set(0)
+                            self._ytdlp_progress_visible = True
+                    except Exception:
+                        pass
+                self.root.after(0, _show_bar)
+
+                def _set_status(msg, color="#AAAAAA"):
+                    self.root.after(0, lambda: status_lbl.configure(text=msg, text_color=color) if status_lbl else None)
+
+                _set_status("Fetching latest release info...")
+
+                r = requests.get(YTDLP_API, timeout=10)
+                r.raise_for_status()
+                data = r.json()
+                latest_tag = data.get("tag_name", "unknown")
+
+                # Find yt-dlp.exe asset (not yt-dlp_x86.exe or others)
+                assets = data.get("assets", [])
+                exe_url = None
+                for asset in assets:
+                    if asset["name"] == "yt-dlp.exe":
+                        exe_url = asset["browser_download_url"]
+                        break
+
+                if not exe_url:
+                    _set_status("Could not find yt-dlp.exe in latest release.", DANGER_COLOR)
+                    return
+
+                _set_status(f"Downloading yt-dlp {latest_tag}...")
+
+                # Download to a temp file first, then replace
+                tmp_path = TEMP_DIR / "yt-dlp_new.exe"
+                with requests.get(exe_url, stream=True, timeout=60) as dl:
+                    dl.raise_for_status()
+                    total = int(dl.headers.get("Content-Length", 0))
+                    downloaded = 0
+                    with open(tmp_path, "wb") as f:
+                        for chunk in dl.iter_content(chunk_size=65536):
+                            if not chunk:
+                                continue
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if total and progress_bar:
+                                pct = downloaded / total
+                                self.root.after(0, lambda p=pct: progress_bar.set(p) if progress_bar else None)
+
+                # Atomic replace
+                import shutil
+                shutil.move(str(tmp_path), str(YT_DLP_EXE))
+
+                _set_status(f"✅ yt-dlp updated to {latest_tag}!", SUCCESS_COLOR)
+                log_message(f"yt-dlp updated to {latest_tag}")
+
+                # Hide progress bar, re-enable button
+                def _done():
+                    try:
+                        if progress_bar and self._ytdlp_progress_visible:
+                            progress_bar.pack_forget()
+                            self._ytdlp_progress_visible = False
+                        if btn:
+                            btn.configure(state="normal", text="⬇️  Update yt-dlp")
+                    except Exception:
+                        pass
+                self.root.after(0, _done)
+
+            except Exception as e:
+                log_message(f"_update_ytdlp error: {e}")
+                def _err():
+                    try:
+                        if status_lbl:
+                            status_lbl.configure(text=f"Update failed: {e}", text_color=DANGER_COLOR)
+                        if progress_bar and self._ytdlp_progress_visible:
+                            progress_bar.pack_forget()
+                            self._ytdlp_progress_visible = False
+                        if btn:
+                            btn.configure(state="normal", text="⬇️  Update yt-dlp")
+                    except Exception:
+                        pass
+                self.root.after(0, _err)
+
+        threading.Thread(target=_do_update, daemon=True).start()
 
     # ──────────────────────────────────────────────────────────────
     #  SETTINGS TAB
@@ -2602,9 +3195,12 @@ class ClipsterApp:
         frame.pack(fill="both", expand=True, padx=12, pady=12)
 
         def section_label(text):
-            ctk.CTkLabel(frame, text=text, anchor="w",
-                         font=ctk.CTkFont(size=12, weight="bold"),
-                         text_color=ACCENT_COLOR).pack(fill="x", padx=8, pady=(16, 2))
+            # Separator line above each section
+            ctk.CTkFrame(frame, height=1, fg_color="#2D2D3A").pack(fill="x", padx=8, pady=(14, 0))
+            lbl = ctk.CTkLabel(frame, text=text, anchor="w",
+                         font=ctk.CTkFont(size=13, weight="bold"),
+                         text_color=ACCENT_COLOR)
+            lbl.pack(fill="x", padx=8, pady=(6, 2))
 
         def row_frame():
             f = ctk.CTkFrame(frame, fg_color="transparent")
@@ -2698,18 +3294,22 @@ class ClipsterApp:
         self.settings_debug_switch.pack(side="left")
 
         lf = row_frame()
-        ctk.CTkButton(lf, text="📄 Open Log File", fg_color=SECONDARY_COLOR, height=36, corner_radius=8,
+        ctk.CTkButton(lf, text="📄  Open Log File", fg_color=SECONDARY_COLOR, hover_color=SECONDARY_HOVER,
+                      height=36, corner_radius=10,
                       command=open_log_file).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(lf, text="🗑️ Clear Log", fg_color="gray", height=36, corner_radius=8,
+        ctk.CTkButton(lf, text="🗑️  Clear Log", fg_color="#4B4B4B", hover_color="#5A5A5A",
+                      height=36, corner_radius=10,
                       command=self._on_clear_log).pack(side="left")
 
         # ── Save / Reset ────────────────────────────────────────────
-        ctk.CTkFrame(frame, height=1, fg_color="#333333").pack(fill="x", padx=8, pady=(16, 6))
+        ctk.CTkFrame(frame, height=1, fg_color="#2D2D3A").pack(fill="x", padx=8, pady=(18, 8))
         btn_frame = ctk.CTkFrame(frame, fg_color="transparent")
         btn_frame.pack(anchor="nw", padx=8, pady=(0, 16))
-        ctk.CTkButton(btn_frame, text="💾 Save Settings", fg_color=ACCENT_COLOR, height=36, corner_radius=8,
+        ctk.CTkButton(btn_frame, text="💾  Save Settings", fg_color=ACCENT_COLOR, hover_color=ACCENT_HOVER,
+                      height=38, corner_radius=10, font=ctk.CTkFont(size=13, weight="bold"),
                       command=self.on_apply_settings).pack(side="left", padx=(0, 8))
-        ctk.CTkButton(btn_frame, text="↺ Reset to Defaults", fg_color="gray", height=36, corner_radius=8,
+        ctk.CTkButton(btn_frame, text="↺  Reset to Defaults", fg_color="#4B4B4B", hover_color="#5A5A5A",
+                      height=38, corner_radius=10,
                       command=self.on_reset_defaults).pack(side="left", padx=4)
 
     def _on_browse_cookies(self):
@@ -3049,20 +3649,16 @@ class ClipsterApp:
         threading.Thread(target=dl_seq_task, daemon=True).start()
 
     def _playlist_row_play_preview(self, row):
-        """Play preview using ffplay."""
+        """Open video in browser (ffplay removed for smaller EXE)."""
         entry = getattr(row, "_entry", None)
         if not entry:
             return
         url = entry.get("url")
-        if not url:
-            return
-        if not FFPLAY_EXE.exists():
-            messagebox.showerror(APP_NAME, "ffplay.exe not found in Assets/. Cannot play preview.")
-            return
-        try:
-            subprocess.Popen([str(FFPLAY_EXE), "-autoexit", "-hide_banner", "-loglevel", "error", url], shell=False)
-        except Exception as e:
-            messagebox.showerror(APP_NAME, f"Failed to launch preview: {e}")
+        if url:
+            import webbrowser
+            webbrowser.open(url)
+        else:
+            messagebox.showinfo(APP_NAME, "No URL available for this item.")
 
     def _playlist_row_open_youtube(self, row):
         import webbrowser
@@ -3273,7 +3869,7 @@ class ClipsterApp:
 
             def on_right_click(ev, r=row):
                 items = [
-                    ("▶ Play Preview", lambda rr=r: self._playlist_row_play_preview(rr)),
+                    ("🌐 Open in Browser", lambda rr=r: self._playlist_row_play_preview(rr)),
                     ("🌐 Open on YouTube", lambda rr=r: self._playlist_row_open_youtube(rr)),
                     ("📋 Copy URL", lambda rr=r: self._playlist_row_copy_url(rr)),
                     ("❌ Remove from list", lambda rr=r: self._playlist_row_remove(rr))
