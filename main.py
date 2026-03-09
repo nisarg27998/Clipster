@@ -8,10 +8,29 @@ import threading
 import tempfile
 import atexit
 import subprocess
-import webbrowser
-import pyperclip
+# webbrowser and pyperclip are imported lazily (faster startup)
 from datetime import datetime
 from pathlib import Path
+
+# -------------------------------------------------------
+# Lazy-loaded modules: imported on first use for speed
+# -------------------------------------------------------
+_wb_mod = None
+_pc_mod = None
+
+def _open_url(url):
+    global _wb_mod
+    if _wb_mod is None:
+        import webbrowser as _m
+        _wb_mod = _m
+    _wb_mod.open(url)
+
+def _copy_to_clipboard(text):
+    global _pc_mod
+    if _pc_mod is None:
+        import pyperclip as _m
+        _pc_mod = _m
+    _pc_mod.copy(text)
 
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
@@ -33,7 +52,7 @@ _HISTORY_RW_LOCK = threading.RLock()
 # Branding / Config
 # --------------------------------------------
 APP_NAME = "Clipster"
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 ACCENT_COLOR = "#2563EB"          # Vibrant blue (Tailwind blue-600)
 ACCENT_HOVER  = "#1D4ED8"         # Darker blue hover
 SECONDARY_COLOR = "#0891B2"       # Cyan-600
@@ -65,12 +84,86 @@ ALLOWED_FORMATS = ["mp4", "mkv", "webm", "m4a", "mp3"]
 
 YOUTUBE_URL_RE = re.compile(r"(https?://)?(www\.)?(youtube\.com|youtu\.be)/.+", re.IGNORECASE)
 YOUTUBE_PLAYLIST_RE = re.compile(r"(youtube\.com|youtu\.be).*[?&]list=", re.IGNORECASE)
-#YOUTUBE_PLAYLIST_RE = re.compile(r"(https?://)?(www\.)?youtube\.com/.*[?&]list=", re.IGNORECASE)
+YOUTUBE_PURE_PLAYLIST_RE = re.compile(
+    r"(https?://)?(www\.)?youtube\.com/(playlist|channel|c/|@)", re.IGNORECASE
+)
+
+
+def _classify_yt_url(url):
+    # Returns "single" | "playlist" | "mixed" | "invalid"
+    # mixed = URL has both a video id (v=) AND a playlist id (list=)
+    from urllib.parse import urlparse, parse_qs
+    url = (url or "").strip()
+    if not YOUTUBE_URL_RE.match(url):
+        return "invalid"
+    try:
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+        has_video = bool(qs.get("v"))
+        has_list  = bool(qs.get("list"))
+        netloc = (parsed.netloc or "").lower()
+        if "youtu.be" in netloc:
+            path_id = parsed.path.lstrip("/")
+            if path_id and has_list:
+                return "mixed"
+            return "single"
+        if YOUTUBE_PURE_PLAYLIST_RE.match(url):
+            return "playlist"
+        if has_video and has_list:
+            return "mixed"
+        if has_list:
+            return "playlist"
+        return "single"
+    except Exception:
+        return "single"
+
+
+
+def _extract_video_id(url):
+    """
+    Extract (video_id, list_id) from any YouTube URL using pure Python.
+    Returns (video_id or None, list_id or None).
+    Zero subprocess cost — used to build clean canonical URLs before any
+    network call is made.
+
+    Examples
+    --------
+    watch?v=ABC&list=PL123  ->  ("ABC", "PL123")
+    youtu.be/ABC?list=PL123 ->  ("ABC", "PL123")
+    youtube.com/playlist?list=PL123 -> (None, "PL123")
+    youtu.be/ABC            ->  ("ABC", None)
+    """
+    from urllib.parse import urlparse, parse_qs
+    try:
+        parsed = urlparse(url.strip())
+        qs = parse_qs(parsed.query)
+        vid = (qs.get("v") or [""])[0] or None
+        lst = (qs.get("list") or [""])[0] or None
+        netloc = (parsed.netloc or "").lower()
+        # youtu.be/<id> — video id is in the path
+        if "youtu.be" in netloc:
+            path_vid = parsed.path.lstrip("/").split("/")[0]
+            if path_vid:
+                vid = path_vid
+        return vid, lst
+    except Exception:
+        return None, None
+
+
+def _canonical_video_url(video_id):
+    """Return a clean, parameter-free YouTube watch URL for a video id."""
+    return f"https://www.youtube.com/watch?v={video_id}"
+
+
+
 YT_DLP_PROGRESS_RE = re.compile(r"\[download\]\s+([\d\.]+)%")
 YT_DLP_SPEED_RE = re.compile(r"at\s+([0-9\.]+\w+/s)")
 YT_DLP_ETA_RE = re.compile(r"ETA\s+([0-9:]+)")
 
 LOG_FILE = BASE_DIR / "clipster.log"
+YTDLP_LAST_CHECK_FILE = BASE_DIR / "ytdlp_last_check.json"
+YTDLP_CHECK_INTERVAL_DAYS = 7  # Auto-check every 7 days
+METADATA_FETCH_TIMEOUT = 20    # Seconds before metadata fetch is aborted
 
 # Module-level app reference (set in __main__) used by log_debug
 _app = None
@@ -85,6 +178,72 @@ def get_pil_image():
         from PIL import Image as PILImage
         Image = PILImage
     return Image
+
+
+def _ytdlp_needs_update_check():
+    """Return True if yt-dlp has not been checked within YTDLP_CHECK_INTERVAL_DAYS."""
+    try:
+        if not YTDLP_LAST_CHECK_FILE.exists():
+            return True
+        data = json.loads(YTDLP_LAST_CHECK_FILE.read_text(encoding="utf-8"))
+        last = datetime.fromisoformat(data.get("last_check", "2000-01-01"))
+        return (datetime.now() - last).days >= YTDLP_CHECK_INTERVAL_DAYS
+    except Exception:
+        return True
+
+def _ytdlp_record_check():
+    """Persist the current timestamp as the last yt-dlp update check."""
+    try:
+        YTDLP_LAST_CHECK_FILE.write_text(
+            json.dumps({"last_check": datetime.now().isoformat()}), encoding="utf-8"
+        )
+    except Exception:
+        pass
+
+def _ytdlp_auto_update_background(ui_queue_ref):
+    """
+    Background task: check whether a newer yt-dlp exists and, if so,
+    silently download and replace it. Posts a ui_queue event on completion.
+    Only runs when _ytdlp_needs_update_check() returns True.
+    """
+    if not _ytdlp_needs_update_check():
+        return
+    _ytdlp_record_check()
+    try:
+        import requests
+        YTDLP_API = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest"
+        r = requests.get(YTDLP_API, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        latest_tag = data.get("tag_name", "")
+        # Compare with installed version
+        if YT_DLP_EXE.exists():
+            result = run_subprocess_safe([str(YT_DLP_EXE), "--version"], timeout=8)
+            installed = (result.get("stdout") or "").strip()
+            if installed and installed == latest_tag:
+                log_message(f"yt-dlp auto-check: already up to date ({installed})")
+                return  # no update needed
+        # Find yt-dlp.exe asset
+        exe_url = next(
+            (a["browser_download_url"] for a in data.get("assets", []) if a["name"] == "yt-dlp.exe"),
+            None
+        )
+        if not exe_url:
+            return
+        log_message(f"yt-dlp auto-update: downloading {latest_tag}...")
+        tmp_path = ASSETS_DIR / "yt-dlp_updating.exe"
+        with requests.get(exe_url, stream=True, timeout=90) as dl:
+            dl.raise_for_status()
+            with open(tmp_path, "wb") as f:
+                for chunk in dl.iter_content(chunk_size=65536):
+                    if chunk:
+                        f.write(chunk)
+        os.replace(str(tmp_path), str(YT_DLP_EXE))
+        log_message(f"yt-dlp auto-updated to {latest_tag}")
+        if ui_queue_ref is not None:
+            ui_queue_ref.put(("ytdlp_auto_updated", latest_tag))
+    except Exception as e:
+        log_message(f"yt-dlp auto-update error: {e}")
 
 
 def run_subprocess_safe(cmd, timeout=300, cwd=None, capture_output=True):
@@ -122,7 +281,31 @@ def run_subprocess_safe(cmd, timeout=300, cwd=None, capture_output=True):
 # Helpers: Sanitize filenames
 # --------------------------------------------
 
-_SAFE_FILENAME_RE = re.compile(r'[^A-Za-z0-9 ._\-()]')
+# Windows-reserved characters -> readable substitutions applied first.
+_WIN_CHAR_MAP = [
+    (":",  " -"),
+    ("?",  ""),
+    ("*",  ""),
+    ("|",  "-"),
+    ("<",  "("),
+    (">",  ")"),
+    ('"', "'"),
+    ("\\", "-"),
+]
+# Final sweep: anything still outside the safe set
+_SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9 .'()._-]")
+
+
+def _sanitize_win_title(t):
+    if not t:
+        return t
+    for ch, sub in _WIN_CHAR_MAP:
+        t = t.replace(ch, sub)
+    t = re.sub(r'  +', ' ', t)
+    t = re.sub(r'--+', '-', t)
+    return t.strip(' -')
+
+
 
 
 
@@ -148,36 +331,77 @@ _YTDLP_NOISE_RE = re.compile(
     re.MULTILINE,
 )
 
-def sanitize_ytdlp_error(raw: str) -> str:
-    """Strip yt-dlp boilerplate from error messages so they read naturally."""
+# (pattern_substring, friendly_message) -- checked before generic stripping
+_YTDLP_FRIENDLY_ERRORS = [
+    ("Sign in to confirm your age",
+     "Age-restricted video -- sign-in required.\n\n"
+     "To fix: export cookies from your browser, then go to\n"
+     "Settings > Authentication and select the cookies file."),
+    ("members-only",
+     "Members-only video -- sign-in required.\n\n"
+     "To fix: export cookies from your browser, then go to\n"
+     "Settings > Authentication and select the cookies file."),
+    ("This video is only available for members",
+     "Members-only video -- sign-in required.\n\n"
+     "To fix: export cookies from your browser, then go to\n"
+     "Settings > Authentication and select the cookies file."),
+    ("This video is private",
+     "Private video -- the owner has restricted access to this video."),
+    ("Private video",
+     "Private video -- the owner has restricted access to this video."),
+    ("Video unavailable",
+     "Video unavailable -- it may have been removed or made private."),
+    ("This video has been removed",
+     "This video was removed by the uploader or YouTube."),
+    ("has been removed",
+     "This video was removed."),
+    ("is not available in your country",
+     "This video is geo-restricted and not available in your region."),
+    ("requires payment",
+     "This video requires a purchase to watch."),
+    ("This live event will begin",
+     "This is a scheduled live event that has not started yet."),
+    ("Premiere will begin",
+     "This is a premiere that has not started yet."),
+    ("Unable to extract",
+     "Could not extract video info -- the URL may be invalid or unsupported."),
+    ("No video formats found",
+     "No downloadable formats were found for this URL."),
+]
+
+
+def sanitize_ytdlp_error(raw):
+    # Map known yt-dlp errors to friendly messages; strip boilerplate for unknown errors.
     if not raw:
         return "Download failed."
-    msg = raw.strip()
-    # Remove leading ERROR: [youtube] [id]: noise
+    raw_s = raw.strip()
+    raw_lower = raw_s.lower()
+    for pattern, friendly in _YTDLP_FRIENDLY_ERRORS:
+        if pattern.lower() in raw_lower:
+            return friendly
+    # Generic fallback: strip yt-dlp boilerplate
+    msg = raw_s
     msg = _YTDLP_ERROR_STRIP_RE.sub("", msg).strip()
-    # Remove exit-code lines, WARNING lines, bare URLs
     msg = _YTDLP_NOISE_RE.sub("", msg).strip()
-    # Collapse whitespace / newlines
     msg = re.sub(r"\s+", " ", msg).strip(": ")
-    # Fall back if we stripped everything
     if not msg or len(msg) < 4:
-        msg = "Download failed — check log for details."
-    # Capitalise first letter
+        msg = "Download failed -- check the log for details."
     return msg[0].upper() + msg[1:]
 
 
 
 def safe_filename(name: str, max_len=200, default="file"):
+    # Produce a Windows-safe filename from a raw video title.
+    # Step 1: human-readable substitutions for Windows-illegal chars.
+    # Step 2: sweep remaining non-safe chars to underscore.
+    # Step 3: trim to max_len preserving extension.
     if not name:
         return default
-    name = str(name)
-    # replace illegal characters
+    name = _sanitize_win_title(str(name))
     cleaned = _SAFE_FILENAME_RE.sub("_", name)
-    # collapse repeated underscores
     cleaned = re.sub(r'_{2,}', '_', cleaned).strip(" _")
     if not cleaned:
         return default
-    # trim length but preserve extension if present
     if len(cleaned) > max_len:
         base, ext = os.path.splitext(cleaned)
         keep = max_len - len(ext)
@@ -282,17 +506,21 @@ def load_history():
 
 
 def _purge_old_temp_files():
-    """Delete temp files older than TEMP_FILE_MAX_AGE_DAYS. Best-effort, never raises."""
+    # Remove ALL staging files from TEMP_DIR on startup -- safe to delete.
+    # Best-effort, never raises. Logs how many were removed.
+    removed = 0
     try:
-        cutoff = time.time() - TEMP_FILE_MAX_AGE_DAYS * 86400
         for p in TEMP_DIR.iterdir():
             try:
-                if p.is_file() and p.stat().st_mtime < cutoff:
+                if p.is_file():
                     p.unlink(missing_ok=True)
+                    removed += 1
             except Exception:
                 pass
     except Exception:
         pass
+    if removed:
+        log_message(f"Startup cleanup: removed {removed} stale file(s) from temp folder.")
 
 
 def append_history(entry):
@@ -518,7 +746,7 @@ def windows_notify(title, message, open_path=None):
                 "title":    title,
                 "body":     message,
                 "duration": "short",
-                "app_id":   "Clipster.App.1.3.1",
+                "app_id":   "Clipster.App.1.3.2",
             }
 
             # App icon in the notification badge
@@ -608,7 +836,7 @@ def _toast(app, message, title=None, timeout=3000, level="info"):
 # --------------------------------------------
 # Metadata via yt-dlp --dump-json (blocking small call)
 # --------------------------------------------
-def fetch_metadata_via_yt_dlp(url, timeout=30):
+def fetch_metadata_via_yt_dlp(url, timeout=METADATA_FETCH_TIMEOUT):
     """Fetch video metadata using yt-dlp; hides console window on Windows."""
     if not YT_DLP_EXE.exists():
         raise FileNotFoundError("yt-dlp.exe not found in Assets/")
@@ -635,9 +863,7 @@ def fetch_metadata_via_yt_dlp(url, timeout=30):
         out = proc.stdout.strip()
         if proc.returncode != 0:
             stderr = (proc.stderr or "").strip() or out
-            if any(x in stderr for x in ("Sign in to confirm your age", "members-only", "This video is only available for members")):
-                raise RuntimeError("This video is age-restricted or members-only and requires sign-in. Clipster cannot download it.")
-            raise RuntimeError(stderr or "yt-dlp failed to fetch metadata")
+            raise RuntimeError(sanitize_ytdlp_error(stderr or "yt-dlp failed to fetch metadata"))
         if not out:
             raise RuntimeError("No metadata returned by yt-dlp")
         # find the first JSON object in output
@@ -650,7 +876,10 @@ def fetch_metadata_via_yt_dlp(url, timeout=30):
             first_json = out
         return json.loads(first_json)
     except subprocess.TimeoutExpired:
-        raise RuntimeError("yt-dlp timed out while fetching metadata")
+        raise RuntimeError(
+            f"Metadata fetch timed out after {timeout}s.\n"
+            "Check your internet connection and try again."
+        )
     except json.JSONDecodeError as e:
         raise RuntimeError(f"Failed to parse yt-dlp output as JSON: {e}")
 # ---------------------------------------------------------------------------------------
@@ -690,7 +919,8 @@ class DownloadProcess:
             if error_callback: error_callback("yt-dlp.exe not found in Assets/")
             return
         outtmpl = os.path.join(outdir, filename_template)
-        cmd = [windows_quote(str(YT_DLP_EXE)), "--no-warnings", "--newline", "--continue"]
+        cmd = [windows_quote(str(YT_DLP_EXE)), "--no-warnings", "--newline", "--continue",
+               "--windows-filenames"]  # auto-replace illegal filename chars
         if cookies_path:
             cmd += ["--cookies", windows_quote(cookies_path)]
         if format_selector == "__mp3__":
@@ -720,10 +950,17 @@ class DownloadProcess:
                     if raw_line is None:
                         continue
                     line = raw_line.strip()
-                    # age-restricted detection
-                    if any(x in line for x in ("Sign in to confirm your age", "This video is only available for members", "This video is private")):
+                    # Detect fatal errors mid-stream; abort early with a clear message
+                    _FATAL_PATTERNS = (
+                        "Sign in to confirm your age",
+                        "This video is only available for members",
+                        "This video is private", "Private video",
+                        "Video unavailable", "This video has been removed",
+                        "is not available in your country", "requires payment",
+                    )
+                    if any(pat in line for pat in _FATAL_PATTERNS):
                         if error_callback:
-                            error_callback("Age-restricted or members-only content detected. Clipster cannot download without authentication.")
+                            error_callback(sanitize_ytdlp_error(line))
                         try:
                             p.terminate()
                         except Exception:
@@ -1006,6 +1243,13 @@ class ClipsterApp:
 
         # Show window after setup to avoid flashing
         self.root.after(0, self._show_window_after_setup)
+
+        # ── Auto yt-dlp weekly update check (background, non-blocking) ──
+        threading.Thread(
+            target=_ytdlp_auto_update_background,
+            args=(self.ui_queue,),
+            daemon=True
+        ).start()
 
     def _build_skeleton_ui(self):
         """Build minimal UI shell with custom animated tab system."""
@@ -1416,7 +1660,7 @@ class ClipsterApp:
         # Re-affirm AppUserModelID now that we have an HWND, ensuring the
         # taskbar groups this window under Clipster (not python.exe)
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Clipster.App.1.3.1")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Clipster.App.1.3.2")
         except Exception:
             pass
 
@@ -1952,6 +2196,11 @@ class ClipsterApp:
         self.dl_url_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
         self.dl_url_entry.bind("<Return>", lambda e: self._dl_add_url())
         ctk.CTkButton(
+            url_bar, text="📋 Paste & Add", fg_color=SECONDARY_COLOR, hover_color=SECONDARY_HOVER,
+            width=130, height=42, corner_radius=10, font=ctk.CTkFont(size=12, weight="bold"),
+            command=self._dl_paste_and_add
+        ).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(
             url_bar, text="Add  +", fg_color=ACCENT_COLOR, hover_color=ACCENT_HOVER,
             width=90, height=42, corner_radius=10, font=ctk.CTkFont(size=13, weight="bold"),
             command=self._dl_add_url
@@ -2016,30 +2265,96 @@ class ClipsterApp:
     # Download Queue Methods
     # ──────────────────────────────────────────────────────────────
 
+    def _dl_paste_and_add(self):
+        """Paste clipboard content into URL entry and immediately add it."""
+        try:
+            clip = self.root.clipboard_get().strip()
+        except Exception:
+            clip = ""
+        if not clip:
+            _toast(self, "Clipboard is empty.", level="error")
+            return
+        self.dl_url_entry.delete(0, "end")
+        self.dl_url_entry.insert(0, clip)
+        self._dl_add_url()
+
     def _dl_add_url(self):
-        url = self.dl_url_entry.get().strip()
-        if not url:
+        """
+        Add a URL to the download queue.
+
+        Flow
+        ----
+        1. Extract video_id and list_id from the URL with pure Python.
+        2. Classify (single / playlist / mixed / invalid).
+        3. Single  -> build clean watch?v=ID URL, add as "fetching", fetch
+                      full metadata in background.
+        4. Mixed   -> ask: "just this video" uses the extracted video_id
+                      (no list= noise); "full playlist" opens playlist panel.
+        5. Playlist -> open playlist panel.
+        """
+        raw_url = self.dl_url_entry.get().strip()
+        if not raw_url:
             return
 
-        if YOUTUBE_PLAYLIST_RE.match(url):
-            # Show inline playlist panel in the Download tab
-            self.dl_url_entry.delete(0, "end")
-            self._dl_show_playlist_panel(url)
-            return
+        # ── Step 1: extract IDs (pure Python, zero network cost) ────
+        video_id, list_id = _extract_video_id(raw_url)
+        url_type = _classify_yt_url(raw_url)
 
-        if not YOUTUBE_URL_RE.match(url):
+        if url_type == "invalid":
             _toast(self, "Not a valid YouTube URL.", level="error")
+            return
+
+        # ── Step 2: route by type ────────────────────────────────────
+        if url_type == "playlist":
+            self.dl_url_entry.delete(0, "end")
+            self._dl_show_playlist_panel(raw_url)
+            return
+
+        if url_type == "mixed":
+            self.dl_url_entry.delete(0, "end")
+            choice = messagebox.askyesnocancel(
+                APP_NAME,
+                "This URL contains a video that is also part of a playlist.\n\n"
+                "Yes    \u2192 Add the full playlist to queue\n"
+                "No     \u2192 Add just this video\n"
+                "Cancel \u2192 Do nothing",
+            )
+            if choice is None:
+                return
+            if choice:
+                # User wants the whole playlist
+                self._dl_show_playlist_panel(raw_url)
+                return
+            # User wants only this video — fall through using clean video_id URL
+
+        # ── Step 3: build clean canonical URL (strips list=, t=, etc.) ──
+        if video_id:
+            url = _canonical_video_url(video_id)
+        else:
+            url = raw_url   # fallback for edge-cases
+
+        # ── Step 4: duplicate detection (compare by video_id) ────────
+        with self._dl_queue_lock:
+            existing_ids = set()
+            for e in self._dl_queue:
+                eid, _ = _extract_video_id(e["url"])
+                if eid:
+                    existing_ids.add(eid)
+        if video_id and video_id in existing_ids:
+            _toast(self, "This video is already in the queue.", level="info")
             return
 
         self.dl_url_entry.delete(0, "end")
 
+        # ── Step 5: create placeholder entry and add to queue ────────
         default_fmt = self.settings.get("default_format", "mp4")
-
         entry = {
             "url":    url,
-            "title":  url,
+            "title":  url,          # replaced once metadata arrives
             "uploader": "",
             "duration": "",
+            "views": "",
+            "upload_date": "",
             "status": "fetching",
             "row":    None,
             "available_resolutions": ["Best Available"],
@@ -2048,12 +2363,11 @@ class ClipsterApp:
             "fmt_selector": build_format_selector_for_format_and_res(default_fmt, "Best Available"),
             "filesize_bytes": None,
             "formats_raw":    [],
-            # widget refs for in-place updates (no full re-render during download)
             "_status_lbl":   None,
             "_progress_bar": None,
             "_speed_lbl":    None,
             "_size_lbl":     None,
-            "_cancel_flag":  threading.Event(),   # set to abort this item's download
+            "_cancel_flag":  threading.Event(),
         }
 
         with self._dl_queue_lock:
@@ -2064,6 +2378,7 @@ class ClipsterApp:
         self._dl_update_summary()
         self._dl_start_fetch_animation()
 
+        # ── Step 6: fetch full metadata in background ─────────────────
         def fetch_task(queue_idx, e):
             try:
                 meta = fetch_metadata_via_yt_dlp(e["url"])
@@ -2071,6 +2386,13 @@ class ClipsterApp:
                 e["uploader"]    = meta.get("uploader", "")
                 e["duration"]    = meta.get("duration_string", "")
                 e["formats_raw"] = meta.get("formats", [])
+                raw_views = meta.get("view_count")
+                e["views"] = f"{raw_views:,}" if isinstance(raw_views, int) else ""
+                raw_date  = meta.get("upload_date", "")
+                if raw_date and len(raw_date) == 8:
+                    e["upload_date"] = f"{raw_date[0:4]}-{raw_date[4:6]}-{raw_date[6:8]}"
+                else:
+                    e["upload_date"] = ""
                 e["available_resolutions"] = parse_available_resolutions(e["formats_raw"])
                 if e["selected_res"] not in e["available_resolutions"]:
                     e["selected_res"] = "Best Available"
@@ -2247,7 +2569,16 @@ class ClipsterApp:
             var.set(False)
 
     def _pl_add_selected_to_queue(self):
-        """Add selected playlist items to the download queue as individual entries."""
+        """
+        Add selected playlist items to the download queue.
+
+        Each item is added immediately as "fetching" using the title already
+        known from the flat-playlist scan.  A single sequential background
+        thread then fetches full metadata for every item one-by-one, flipping
+        each row to "ready" (with real duration, views, resolutions, file-size)
+        as data arrives.  The user can start downloading any ready items while
+        the rest are still being fetched.
+        """
         selected = [(var, e) for var, e in self._pl_rows if var.get()]
         if not selected:
             _toast(self, "No items selected.", level="error")
@@ -2255,21 +2586,27 @@ class ClipsterApp:
 
         fmt = self._pl_format_combo.get()
         res = self._pl_res_combo.get()
-        fmt_selector = build_batch_format_selector(fmt, res)
 
-        added = 0
-        for _, entry in selected:
+        # Collect (queue_idx, entry_dict) for the sequential fetcher
+        batch = []
+        for _, pl_entry in selected:
+            # Build a clean canonical URL from the video id in the flat-fetch data
+            vid_id = pl_entry.get("id") or ""
+            url    = _canonical_video_url(vid_id) if vid_id else pl_entry["url"]
+
             q_entry = {
-                "url":    entry["url"],
-                "title":  entry["title"],
+                "url":    url,
+                "title":  pl_entry["title"],   # flat-fetch title (placeholder)
                 "uploader": "",
                 "duration": "",
-                "status": "ready",
+                "views": "",
+                "upload_date": "",
+                "status": "fetching",           # real metadata still on the way
                 "row":    None,
-                "available_resolutions": [res],
+                "available_resolutions": ["Best Available"],
                 "selected_res": res,
                 "selected_fmt": fmt,
-                "fmt_selector": fmt_selector,
+                "fmt_selector": build_batch_format_selector(fmt, res),
                 "filesize_bytes": None,
                 "formats_raw": [],
                 "_status_lbl":   None,
@@ -2281,13 +2618,59 @@ class ClipsterApp:
                 "_cancel_flag":  threading.Event(),
             }
             with self._dl_queue_lock:
+                idx = len(self._dl_queue)
                 self._dl_queue.append(q_entry)
-            added += 1
+            batch.append((idx, q_entry))
 
         self._dl_render_queue()
         self._dl_update_summary()
         self._dl_dismiss_playlist_panel()
-        _toast(self, f"Added {added} playlist items to queue.", title="Playlist")
+        self._dl_start_fetch_animation()
+        _toast(self, f"Added {len(batch)} items. Fetching metadata...", title="Playlist")
+
+        # Start sequential metadata fetch (one thread, items processed in order)
+        threading.Thread(
+            target=self._pl_fetch_metadata_sequential,
+            args=(batch, fmt),
+            daemon=True
+        ).start()
+
+    def _pl_fetch_metadata_sequential(self, batch, fmt):
+        """
+        Background worker: fetch full yt-dlp metadata for each playlist item
+        in order, one at a time.  Posts dl_meta_ready (or dl_item_status
+        "error") for each item so the UI can update the queue row live.
+        """
+        for queue_idx, entry in batch:
+            try:
+                meta = fetch_metadata_via_yt_dlp(entry["url"])
+                entry["title"]       = meta.get("title", entry["url"])
+                entry["uploader"]    = meta.get("uploader", "")
+                entry["duration"]    = meta.get("duration_string", "")
+                entry["formats_raw"] = meta.get("formats", [])
+                raw_views = meta.get("view_count")
+                entry["views"] = f"{raw_views:,}" if isinstance(raw_views, int) else ""
+                raw_date = meta.get("upload_date", "")
+                if raw_date and len(raw_date) == 8:
+                    entry["upload_date"] = (
+                        f"{raw_date[0:4]}-{raw_date[4:6]}-{raw_date[6:8]}"
+                    )
+                else:
+                    entry["upload_date"] = ""
+                entry["available_resolutions"] = parse_available_resolutions(
+                    entry["formats_raw"]
+                )
+                if entry["selected_res"] not in entry["available_resolutions"]:
+                    entry["selected_res"] = "Best Available"
+                entry["filesize_bytes"] = estimate_filesize_bytes(
+                    entry["formats_raw"], fmt, entry["selected_res"]
+                )
+                entry["fmt_selector"] = build_format_selector_for_format_and_res(
+                    fmt, entry["selected_res"]
+                )
+                self.ui_queue.put(("dl_meta_ready", queue_idx))
+            except Exception as ex:
+                self.ui_queue.put(("dl_item_status", queue_idx, "error", str(ex)))
 
     def _dl_update_summary(self):
         """Recompute and refresh the overall progress bar + summary label."""
@@ -2379,17 +2762,30 @@ class ClipsterApp:
         except Exception as e:
             log_message(f"_dl_render_queue error: {e}")
 
+    def _dl_move_item(self, idx, direction):
+        """Move queue item up (-1) or down (+1) and re-render."""
+        with self._dl_queue_lock:
+            n = len(self._dl_queue)
+            new_idx = idx + direction
+            if 0 <= new_idx < n:
+                self._dl_queue[idx], self._dl_queue[new_idx] = (
+                    self._dl_queue[new_idx], self._dl_queue[idx]
+                )
+        self._dl_render_queue()
+        self._dl_update_summary()
+
     def _dl_build_row(self, i, entry):
         """Build a single queue row and store widget refs on the entry dict."""
         status   = entry.get("status", "pending")
         is_audio = entry.get("selected_fmt", "mp4") in ("mp3", "m4a")
         is_downloading = status == "downloading"
+        total_items = len(self._dl_queue)
 
         row = ctk.CTkFrame(self.dl_queue_scroll, corner_radius=10)
         row.pack(fill="x", padx=4, pady=4)
         row.grid_columnconfigure(1, weight=1)
 
-        # ── Line 1: badge  title  remove ──────────────────────────────
+        # ── Line 1: badge  title  reorder  remove ─────────────────────
         badge_color, badge_text = {
             "pending":     ("#3A3A4A", "⏺  Pending"),
             "fetching":    ("#2D3748", "⏳  Fetching"),
@@ -2407,16 +2803,35 @@ class ClipsterApp:
         status_lbl.grid(row=0, column=0, padx=(10, 8), pady=(10, 4), sticky="w")
         entry["_status_lbl"] = status_lbl
 
-        title_text = truncate_text(entry.get("title", entry["url"]), 75)
+        title_text = truncate_text(entry.get("title", entry["url"]), 68)
         if status == "error":
             raw_err = entry.get("error", "Download failed.")
-            title_text = "✖  " + truncate_text(sanitize_ytdlp_error(raw_err), 70)
+            title_text = "✖  " + truncate_text(sanitize_ytdlp_error(raw_err), 63)
         title_lbl = ctk.CTkLabel(
             row, text=title_text, anchor="w",
             font=ctk.CTkFont(size=13, weight="bold")
         )
         title_lbl.grid(row=0, column=1, sticky="w", padx=(0, 4), pady=(10, 4))
         entry["_title_lbl"] = title_lbl
+
+        # Reorder buttons — only for ready/pending/error, not while downloading or done
+        reorder_frame = ctk.CTkFrame(row, fg_color="transparent")
+        reorder_frame.grid(row=0, column=2, padx=(0, 4), pady=(10, 4))
+        can_reorder = status not in ("downloading", "done")
+        ctk.CTkButton(
+            reorder_frame, text="▲", width=26, height=26,
+            fg_color="transparent", hover_color="#3A3A5A",
+            corner_radius=6, font=ctk.CTkFont(size=11),
+            state="normal" if (can_reorder and i > 0) else "disabled",
+            command=lambda idx=i: self._dl_move_item(idx, -1)
+        ).pack(side="left", padx=(0, 2))
+        ctk.CTkButton(
+            reorder_frame, text="▼", width=26, height=26,
+            fg_color="transparent", hover_color="#3A3A5A",
+            corner_radius=6, font=ctk.CTkFont(size=11),
+            state="normal" if (can_reorder and i < total_items - 1) else "disabled",
+            command=lambda idx=i: self._dl_move_item(idx, 1)
+        ).pack(side="left")
 
         def make_remove(idx=i):
             return lambda: self._dl_remove_item(idx)
@@ -2425,28 +2840,44 @@ class ClipsterApp:
             fg_color="transparent", hover_color=DANGER_COLOR,
             corner_radius=7, font=ctk.CTkFont(size=13),
             command=make_remove()
-        ).grid(row=0, column=2, padx=(0, 10), pady=(10, 4))
+        ).grid(row=0, column=3, padx=(0, 10), pady=(10, 4))
 
-        # ── Line 2: meta  res-combo  size ─────────────────────────────
+        # ── Line 2: Video Info Panel (channel · duration · views · date) ──
         meta_frame = ctk.CTkFrame(row, fg_color="transparent")
-        meta_frame.grid(row=1, column=0, columnspan=3, sticky="ew", padx=(8, 8), pady=(0, 4))
+        meta_frame.grid(row=1, column=0, columnspan=4, sticky="ew", padx=(8, 8), pady=(0, 2))
 
-        uploader = entry.get("uploader", "")
-        duration = entry.get("duration", "")
-        meta_parts = [p for p in [uploader, duration] if p]
-        meta_str = "  ·  ".join(meta_parts) if meta_parts else (
-            "Fetching info..." if status == "fetching" else "")
+        uploader    = entry.get("uploader", "")
+        duration    = entry.get("duration", "")
+        views       = entry.get("views", "")
+        upload_date = entry.get("upload_date", "")
+
+        if status == "fetching":
+            meta_str = "Fetching info..."
+        elif status in ("error",):
+            meta_str = ""
+        else:
+            info_parts = []
+            if uploader:   info_parts.append(f"📺 {uploader}")
+            if duration:   info_parts.append(f"⏱ {duration}")
+            if views:      info_parts.append(f"👁 {views} views")
+            if upload_date: info_parts.append(f"📅 {upload_date}")
+            meta_str = "   ·   ".join(info_parts)
+
         if meta_str:
             ctk.CTkLabel(
                 meta_frame, text=meta_str, anchor="w",
                 font=ctk.CTkFont(size=11), text_color="#888888"
-            ).pack(side="left", padx=(0, 10))
+            ).pack(side="left", padx=(2, 10))
+
+        # ── Line 3: res-combo  size ────────────────────────────────────
+        ctrl_frame = ctk.CTkFrame(row, fg_color="transparent")
+        ctrl_frame.grid(row=2, column=0, columnspan=4, sticky="ew", padx=(8, 8), pady=(0, 4))
 
         # Resolution combo — only for video formats, only when not done/error
         if not is_audio and status not in ("done", "error"):
             avail_res = entry.get("available_resolutions", ["Best Available"])
             res_combo = ctk.CTkComboBox(
-                meta_frame,
+                ctrl_frame,
                 values=avail_res,
                 width=130, height=26, corner_radius=6,
                 font=ctk.CTkFont(size=11),
@@ -2457,7 +2888,7 @@ class ClipsterApp:
 
             sz_text = format_filesize(entry.get("filesize_bytes")) if status == "ready" else ""
             size_lbl = ctk.CTkLabel(
-                meta_frame, text=sz_text,
+                ctrl_frame, text=sz_text,
                 font=ctk.CTkFont(size=11), text_color="#aaaaaa", width=80, anchor="w"
             )
             size_lbl.pack(side="left")
@@ -2476,16 +2907,16 @@ class ClipsterApp:
 
         elif is_audio and status == "ready":
             size_lbl = ctk.CTkLabel(
-                meta_frame, text=format_filesize(entry.get("filesize_bytes")),
+                ctrl_frame, text=format_filesize(entry.get("filesize_bytes")),
                 font=ctk.CTkFont(size=11), text_color="#aaaaaa"
             )
             size_lbl.pack(side="left")
             entry["_size_lbl"] = size_lbl
 
-        # ── Line 3: per-item progress bar + speed/ETA + cancel (only while downloading) ──
+        # ── Line 4: per-item progress bar + speed/ETA + cancel (only while downloading) ──
         if is_downloading:
             prog_frame = ctk.CTkFrame(row, fg_color="transparent")
-            prog_frame.grid(row=2, column=0, columnspan=3, sticky="ew",
+            prog_frame.grid(row=3, column=0, columnspan=4, sticky="ew",
                             padx=(8, 8), pady=(0, 8))
 
             pbar = ctk.CTkProgressBar(
@@ -2570,8 +3001,6 @@ class ClipsterApp:
         self._dl_update_summary()
 
     def _dl_start_all(self):
-        import shutil
-
         with self._dl_queue_lock:
             items = [(i, e) for i, e in enumerate(self._dl_queue)
                      if e.get("status") in ("ready", "error")]
@@ -2593,88 +3022,103 @@ class ClipsterApp:
 
         cookies_path = self.settings.get("cookies_path", "") or None
         filename_template = (
-            "%(uploader)s - %(title)s.%(ext)s"
+            "%(uploader)s - %(title)s - %(upload_date>%Y-%m-%d)s.%(ext)s"
             if self.settings.get("use_smart_naming", True)
             else "%(title)s.%(ext)s"
         )
 
+        max_workers = max(1, int(self.settings.get("max_concurrent_downloads", 1)))
         self.dl_download_btn.configure(state="disabled")
         total_count = len(items)
 
-        def dl_task():
-            completed = 0
+        # ── Concurrent download worker pool ───────────────────────────
+        # Each item gets its own DownloadProcess so yt-dlp processes run
+        # truly in parallel.  A threading.Semaphore caps concurrency.
+        semaphore = threading.Semaphore(max_workers)
+        completed_lock = threading.Lock()
+        completed_counter = [0]
+        pending_counter   = [total_count]
+
+        def _run_one(queue_idx, entry):
+            cancel_flag = entry.get("_cancel_flag")
+            if cancel_flag:
+                cancel_flag.clear()
+
+            fmt_selector = entry.get("fmt_selector") or global_selector
+            self.ui_queue.put(("dl_item_status", queue_idx, "downloading", ""))
+
+            finished_event = threading.Event()
+            result = {"path": None, "error": None}
+            # Each concurrent slot gets its own DownloadProcess instance
+            proc = DownloadProcess()
+
+            def progress_cb(percent, speed, eta, raw, _qidx=queue_idx, _entry=entry):
+                pval = (percent or 0.0) / 100.0
+                _entry["_progress_pct"] = pval
+                speed_text = speed or ""
+                if eta:
+                    speed_text += f"  ETA {eta}"
+                _entry["_speed_text"] = speed_text
+                self.ui_queue.put(("dl_item_progress", _qidx, pval, speed_text))
+
+            def finished_cb(path, _r=result, _ev=finished_event):
+                _r["path"] = path
+                _ev.set()
+
+            def error_cb(err, _r=result, _ev=finished_event):
+                _r["error"] = sanitize_ytdlp_error(err)
+                _ev.set()
+
+            proc.start_download(
+                entry["url"], outdir, filename_template,
+                fmt_selector, cookies_path,
+                progress_cb, finished_cb, error_cb
+            )
+
+            while not finished_event.is_set():
+                if cancel_flag and cancel_flag.is_set():
+                    proc.cancel()
+                    finished_event.wait(timeout=2)
+                    break
+                time.sleep(0.25)
+
+            proc.shutdown()
+            semaphore.release()
+
+            cancelled = cancel_flag and cancel_flag.is_set()
+            if cancelled:
+                entry["_progress_pct"] = 0.0
+                self.ui_queue.put(("dl_item_status", queue_idx, "error", "Cancelled by user"))
+            elif result["error"]:
+                entry["_progress_pct"] = 0.0
+                self.ui_queue.put(("dl_item_status", queue_idx, "error", result["error"]))
+            else:
+                with completed_lock:
+                    completed_counter[0] += 1
+                entry["_progress_pct"] = 1.0
+                append_history({
+                    "url":           entry["url"],
+                    "title":         entry.get("title", ""),
+                    "uploader":      entry.get("uploader", ""),
+                    "format":        entry.get("selected_fmt", global_fmt),
+                    "resolution":    entry.get("selected_res", "Best Available"),
+                    "download_path": outdir,
+                    "date":          now_str(),
+                })
+                self.ui_queue.put(("dl_item_status", queue_idx, "done", ""))
+
+            with completed_lock:
+                pending_counter[0] -= 1
+                if pending_counter[0] == 0:
+                    self.ui_queue.put(("dl_all_finished", completed_counter[0], total_count))
+
+        def dl_coordinator():
             for queue_idx, entry in items:
-                # Reset cancel flag for this item before starting
-                cancel_flag = entry.get("_cancel_flag")
-                if cancel_flag:
-                    cancel_flag.clear()
+                semaphore.acquire()
+                t = threading.Thread(target=_run_one, args=(queue_idx, entry), daemon=True)
+                t.start()
 
-                fmt_selector = entry.get("fmt_selector") or global_selector
-
-                # Flip status → downloading (triggers full row rebuild with progress bar)
-                self.ui_queue.put(("dl_item_status", queue_idx, "downloading", ""))
-
-                finished_event = threading.Event()
-                result = {"path": None, "error": None}
-
-                def progress_cb(percent, speed, eta, raw, _qidx=queue_idx, _entry=entry):
-                    pval = (percent or 0.0) / 100.0
-                    _entry["_progress_pct"] = pval
-                    speed_text = ""
-                    if speed:
-                        speed_text = speed
-                    if eta:
-                        speed_text += f"  ETA {eta}"
-                    _entry["_speed_text"] = speed_text
-                    self.ui_queue.put(("dl_item_progress", _qidx, pval, speed_text))
-
-                def finished_cb(path, _r=result, _ev=finished_event):
-                    _r["path"] = path
-                    _ev.set()
-
-                def error_cb(err, _r=result, _ev=finished_event):
-                    _r["error"] = sanitize_ytdlp_error(err)
-                    _ev.set()
-
-                self.download_proc.start_download(
-                    entry["url"], outdir, filename_template,
-                    fmt_selector, cookies_path,
-                    progress_cb, finished_cb, error_cb
-                )
-
-                while not finished_event.is_set():
-                    # Check per-item cancel flag
-                    if cancel_flag and cancel_flag.is_set():
-                        self.download_proc.cancel()
-                        finished_event.wait(timeout=2)
-                        break
-                    time.sleep(0.25)
-
-                cancelled = cancel_flag and cancel_flag.is_set()
-
-                if cancelled:
-                    entry["_progress_pct"] = 0.0
-                    self.ui_queue.put(("dl_item_status", queue_idx, "error", "Cancelled by user"))
-                elif result["error"]:
-                    entry["_progress_pct"] = 0.0
-                    self.ui_queue.put(("dl_item_status", queue_idx, "error", result["error"]))
-                else:
-                    completed += 1
-                    entry["_progress_pct"] = 1.0
-                    append_history({
-                        "url":           entry["url"],
-                        "title":         entry.get("title", ""),
-                        "uploader":      entry.get("uploader", ""),
-                        "format":        entry.get("selected_fmt", global_fmt),
-                        "resolution":    entry.get("selected_res", "Best Available"),
-                        "download_path": outdir,
-                        "date":          now_str(),
-                    })
-                    self.ui_queue.put(("dl_item_status", queue_idx, "done", ""))
-
-            self.ui_queue.put(("dl_all_finished", completed, total_count))
-
-        threading.Thread(target=dl_task, daemon=True).start()
+        threading.Thread(target=dl_coordinator, daemon=True).start()
 
 
     def _build_playlist_tab(self, parent):
@@ -2804,7 +3248,15 @@ class ClipsterApp:
             self.root.after(300, self.load_and_render_history)
 
     def refresh_history(self):
-        """Refresh history list UI."""
+        """Refresh history list UI. No-ops gracefully if the History tab has not been built yet."""
+        # The History tab is built lazily — widgets may not exist yet.
+        if not hasattr(self, 'history_scroll'):
+            return
+        try:
+            if not self.history_scroll.winfo_exists():
+                return
+        except Exception:
+            return
         for widget in list(self.history_scroll.winfo_children()):
             try:
                 if widget.winfo_exists():
@@ -2831,13 +3283,18 @@ class ClipsterApp:
         """Load history in a background thread after startup."""
         if self._history_loaded:
             return
-        try:
-            time.sleep(0.1)  # Small delay to let UI settle
-            self.history = load_history()
-            self._history_loaded = True
-            self.safe_ui_call(self.refresh_history)
-        except Exception as e:
-            log_message(f"load_and_render_history failed: {e}")
+
+        def _bg():
+            try:
+                import time as _time
+                _time.sleep(0.1)  # Small delay to let UI settle (runs off main thread)
+                self.history = load_history()
+                self._history_loaded = True
+                self.safe_ui_call(self.refresh_history)
+            except Exception as e:
+                log_message(f"load_and_render_history failed: {e}")
+
+        threading.Thread(target=_bg, daemon=True).start()
 
 
     def _create_history_row(self, idx, entry):
@@ -2935,13 +3392,13 @@ class ClipsterApp:
         """Open the video URL in the default web browser."""
         url = entry.get("url", "")
         if url:
-            webbrowser.open(url)
+            _open_url(url)
 
     def _history_copy_url(self, entry):
         """Copy the video URL to clipboard."""
         url = entry.get("url", "")
         if url:
-            pyperclip.copy(url)
+            _copy_to_clipboard(url)
             _toast(self, "URL copied to clipboard")
 
     def _delete_history_entry(self, idx):
@@ -2950,7 +3407,6 @@ class ClipsterApp:
         self.refresh_history()
 
     def _build_update_tab(self, parent):
-        import webbrowser
         """Build the Update tab (checks GitHub for latest release)."""
         frame = ctk.CTkFrame(parent, corner_radius=12)
         frame.pack(fill="both", expand=True, padx=12, pady=12)
@@ -2999,7 +3455,7 @@ class ClipsterApp:
             width=160,
             corner_radius=10,
             font=ctk.CTkFont(size=13),
-            command=lambda: webbrowser.open(GITHUB_RELEASES_URL),
+            command=lambda: _open_url(GITHUB_RELEASES_URL),
         )
         self.update_open_btn.pack(side="left", padx=6)
 
@@ -3057,7 +3513,7 @@ class ClipsterApp:
             width=155,
             corner_radius=10,
             font=ctk.CTkFont(size=13),
-            command=lambda: webbrowser.open("https://github.com/yt-dlp/yt-dlp/releases"),
+            command=lambda: _open_url("https://github.com/yt-dlp/yt-dlp/releases"),
         ).pack(side="left", padx=6)
 
         # Check for Clipster app updates on load
@@ -3134,8 +3590,9 @@ class ClipsterApp:
 
                 _set_status(f"Downloading yt-dlp {latest_tag}...")
 
-                # Download to a temp file first, then replace
-                tmp_path = TEMP_DIR / "yt-dlp_new.exe"
+                # Download to a staging file in the SAME directory as yt-dlp.exe
+                # so os.replace() is guaranteed atomic (same volume, no cross-drive copy).
+                tmp_path = ASSETS_DIR / "yt-dlp_updating.exe"
                 with requests.get(exe_url, stream=True, timeout=60) as dl:
                     dl.raise_for_status()
                     total = int(dl.headers.get("Content-Length", 0))
@@ -3150,9 +3607,8 @@ class ClipsterApp:
                                 pct = downloaded / total
                                 self.root.after(0, lambda p=pct: progress_bar.set(p) if progress_bar else None)
 
-                # Atomic replace
-                import shutil
-                shutil.move(str(tmp_path), str(YT_DLP_EXE))
+                # Atomic replace — os.replace works even when dest already exists on Windows
+                os.replace(str(tmp_path), str(YT_DLP_EXE))
 
                 _set_status(f"✅ yt-dlp updated to {latest_tag}!", SUCCESS_COLOR)
                 log_message(f"yt-dlp updated to {latest_tag}")
@@ -3655,20 +4111,18 @@ class ClipsterApp:
             return
         url = entry.get("url")
         if url:
-            import webbrowser
-            webbrowser.open(url)
+            _open_url(url)
         else:
             messagebox.showinfo(APP_NAME, "No URL available for this item.")
 
     def _playlist_row_open_youtube(self, row):
-        import webbrowser
         """Open video on YouTube."""
         entry = getattr(row, "_entry", None)
         if not entry:
             return
         url = entry.get("url")
         if url:
-            webbrowser.open(url)
+            _open_url(url)
 
     def _playlist_row_copy_url(self, row):
         """Copy video URL to clipboard."""
@@ -3836,7 +4290,7 @@ class ClipsterApp:
             return
         if ev == "single_error_restricted":
             err = item[1]
-            messagebox.showerror(APP_NAME, "This video requires sign-in (age-restricted or members-only).\n\nTip: use yt-dlp with a cookies file.")
+            messagebox.showerror(APP_NAME, "This video is age-restricted or members-only and requires sign-in.\n\n💡 To fix this:\n1. Export your YouTube cookies from your browser\n2. Go to Settings → Authentication\n3. Select your cookies file\n\nThen try downloading again.")
             try: self.dl_download_btn.configure(state="normal")
             except Exception: pass
             return
@@ -3977,6 +4431,16 @@ class ClipsterApp:
                 open_path=_outdir
             )
             self.refresh_history()
+            return
+
+        if ev == "ytdlp_auto_updated":
+            tag = item[1]
+            _toast(self, f"yt-dlp auto-updated to {tag}", title="yt-dlp", timeout=5000)
+            # Refresh the displayed version if the Update tab is open
+            try:
+                self._show_ytdlp_current_version()
+            except Exception:
+                pass
             return
 
         if ev == "update_status":

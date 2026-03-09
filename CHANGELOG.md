@@ -4,6 +4,29 @@ All notable changes to **Clipster** are documented here.
 
 ---
 
+## [1.3.2] - 2026-03-09
+
+### 🚀 Improvements
+
+- Improved download queue performance
+- Optimized per-item progress updates (reduced UI redraw)
+- Improved metadata fetching logic
+- Improved playlist sequential metadata fetch pipeline
+
+### 🧠 Stability
+
+- Better thread safety in download queue updates
+- Improved cancellation handling
+- Reduced UI race conditions during progress updates
+- Minor performance optimizations across UI rendering
+
+### 🎨 UI
+
+- Minor visual refinements in queue rows
+- Improved status badge animations
+
+---
+
 ## [1.3.1] - 2026-02-27
 
 ### 🚀 Major Download System Upgrade

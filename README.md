@@ -6,40 +6,26 @@
 
 ---
 
-## 🚀 What's New in v1.3.1
+## 🚀 What's New in v1.3.2
 
-This release introduces a **major download system upgrade** with a new queue architecture and inline playlist experience.
+### 🚀 Improvements
 
-### 📥 New Queue-Based Download System
+- Improved download queue performance
+- Optimized per-item progress updates (reduced UI redraw)
+- Improved metadata fetching logic
+- Improved playlist sequential metadata fetch pipeline
 
-- Multi-video download queue
-- Per-item progress bars
-- Per-item cancel button
-- Overall download progress summary
-- Live speed + ETA per video
-- Smarter resolution & file size updates
+### 🧠 Stability
 
-### 📋 Inline Playlist Panel (NEW)
+- Better thread safety in download queue updates
+- Improved cancellation handling
+- Reduced UI race conditions during progress updates
+- Minor performance optimizations across UI rendering
 
-- Playlist detection inside Download tab
-- Fetch playlist items inline (no tab switching)
-- Select / Deselect items
-- Choose format + max resolution
-- Add selected items directly to queue
+### 🎨 UI
 
-### 🧠 Architecture Improvements
-
-- Thread-safe per-item progress updates
-- Cleaner UI refresh logic (no full redraw during download)
-- Improved yt-dlp error sanitization
-- Safer shutdown & cancellation handling
-
-### 🎨 Windows 11 UI Refinement
-
-- Custom native-feeling titlebar
-- Rounded corners + Mica integration
-- Improved tab animation system
-- Cleaner progress styling
+- Minor visual refinements in queue rows
+- Improved status badge animations
 
 ---
 
