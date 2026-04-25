@@ -9,7 +9,6 @@
 ## 📸 Screenshots
 
 ![Clipster Main Interface](Assets/app_screenshot.png)
-*(You can add more images here using the same format)*
 
 ---
 
