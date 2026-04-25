@@ -4,6 +4,23 @@ All notable changes to **Clipster** are documented here.
 
 ---
 
+## [1.3.3] - 2026-04-25
+
+### 🚀 Improvements
+
+- **Native Notifications**: Replaced custom UI toasts with native Windows 11 system notifications (`win11toast`) for tray updates.
+- **High-DPI Awareness**: App now explicitly sets Per-Monitor DPI Awareness before UI creation to prevent blurry text/rendering on modern high-resolution displays.
+- **Single Instance Lock**: Added a Windows Mutex check to prevent multiple instances of the app from running. Launching the app again now brings the already-running instance to the foreground.
+- **Standardized App Data**: Moved all app data (folders like `Assets`, `temp`, `downloads`, and files like `settings.json`, `history.json`) out of the executable folder and into `%LOCALAPPDATA%\Clipster` to keep the user's directories clean and prevent permission errors.
+- **Close Behavior**: Modified the title bar's "X" close button to fully exit the application safely rather than minimizing it to the system tray.
+
+### 🐞 Fixes
+
+- **Python Syntax Fix**: Fixed a `SyntaxError` (`name 'YT_DLP_EXE' is used prior to global declaration`) in the auto-update background task.
+- **PyInstaller Resource Resolution**: Added `_bootstrap_assets()` to seamlessly copy bundled tools to persistent storage on the first run of a `--onefile` build, preventing "file not found" errors and allowing in-place executable updates.
+
+---
+
 ## [1.3.2] - 2026-03-09
 
 ### 🚀 Improvements

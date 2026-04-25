@@ -6,26 +6,27 @@
 
 ---
 
-## 🚀 What's New in v1.3.2
+## 📸 Screenshots
+
+![Clipster Main Interface](Assets/app_screenshot.png)
+*(You can add more images here using the same format)*
+
+---
+
+## 🚀 What's New in v1.3.3
 
 ### 🚀 Improvements
 
-- Improved download queue performance
-- Optimized per-item progress updates (reduced UI redraw)
-- Improved metadata fetching logic
-- Improved playlist sequential metadata fetch pipeline
+- **Native System Notifications**: Integrated `win11toast` for native Windows system tray alerts.
+- **High-DPI Awareness**: Fixed blurry scaling on high-resolution monitors.
+- **Single Instance Lock**: Ensures only one instance of Clipster runs at a time; automatically brings the active window forward if launched again.
+- **Local AppData Migration**: Downloads, settings, and internal assets now properly live in `%LOCALAPPDATA%\Clipster`, keeping your standalone `.exe` folder perfectly clean.
+- **Updated Close Behavior**: The app now completely quits when the "X" button is pressed.
 
-### 🧠 Stability
+### 🐞 Fixes
 
-- Better thread safety in download queue updates
-- Improved cancellation handling
-- Reduced UI race conditions during progress updates
-- Minor performance optimizations across UI rendering
-
-### 🎨 UI
-
-- Minor visual refinements in queue rows
-- Improved status badge animations
+- Fixed a syntax error in the yt-dlp auto-updater logic.
+- Implemented robust asset bootstrapping for PyInstaller standalone builds to ensure bundled ffmpeg and yt-dlp binaries extract safely.
 
 ---
 

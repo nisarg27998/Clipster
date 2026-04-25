@@ -13,6 +13,23 @@ from datetime import datetime
 from pathlib import Path
 
 # -------------------------------------------------------
+# Fix: --windowed / --noconsole EXE has no console attached.
+# Some libraries (yt-dlp, requests) will crash if they try
+# to print to a None stdout/stderr.  Redirect to devnull.
+# -------------------------------------------------------
+if getattr(sys, "frozen", False):
+    try:
+        if sys.stdout is None:
+            sys.stdout = open(os.devnull, "w")
+    except Exception:
+        pass
+    try:
+        if sys.stderr is None:
+            sys.stderr = open(os.devnull, "w")
+    except Exception:
+        pass
+
+# -------------------------------------------------------
 # Lazy-loaded modules: imported on first use for speed
 # -------------------------------------------------------
 _wb_mod = None
@@ -31,6 +48,25 @@ def _copy_to_clipboard(text):
         import pyperclip as _m
         _pc_mod = _m
     _pc_mod.copy(text)
+
+# -------------------------------------------------------
+# Fix: Set Per-Monitor DPI Awareness before any UI is
+# created.  Prevents blurry rendering on high-DPI screens.
+# Must happen before customtkinter / tkinter is imported.
+# -------------------------------------------------------
+def _set_dpi_awareness():
+    try:
+        import ctypes
+        # PROCESS_PER_MONITOR_DPI_AWARE = 2  (Windows 8.1+)
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            import ctypes
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+_set_dpi_awareness()
 
 import customtkinter as ctk
 from tkinter import filedialog, messagebox
@@ -52,7 +88,7 @@ _HISTORY_RW_LOCK = threading.RLock()
 # Branding / Config
 # --------------------------------------------
 APP_NAME = "Clipster"
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.3.3"
 ACCENT_COLOR = "#2563EB"          # Vibrant blue (Tailwind blue-600)
 ACCENT_HOVER  = "#1D4ED8"         # Darker blue hover
 SECONDARY_COLOR = "#0891B2"       # Cyan-600
@@ -66,7 +102,41 @@ GITHUB_API_LATEST = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest
 GITHUB_RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
 
 
-BASE_DIR = Path(__file__).resolve().parent
+# -------------------------------------------------------
+# Fix 1: Resource / path resolution for PyInstaller --onefile
+#
+# When frozen:
+#   sys.frozen  == True
+#   sys._MEIPASS == temp extraction dir (deleted on exit) — read-only
+#   sys.executable == path to the actual .exe on disk    — writable
+#
+# Strategy
+#   _APP_DIR    = folder that contains the EXE (or script in dev mode)
+#   _BUNDLE_DIR = PyInstaller's temp dir (frozen) or same as _APP_DIR (dev)
+#   ASSETS_DIR  = _APP_DIR / "Assets"   <-- persistent, writable
+#
+# On the very first run after install, _bootstrap_assets() copies every
+# file from _BUNDLE_DIR/Assets that does not yet exist in ASSETS_DIR.
+# This lets yt-dlp, ffmpeg, icons etc. be found at a stable path AND
+# lets yt-dlp be updated in-place (the temp dir is gone anyway after exit).
+# -------------------------------------------------------
+def _get_app_dir() -> Path:
+    """Return the local AppData folder for the app when frozen."""
+    if getattr(sys, "frozen", False):
+        # Uses C:\Users\<YourUser>\AppData\Local\Clipster on Windows
+        app_data_dir = Path.home() / "AppData" / "Local" / "Clipster"
+        app_data_dir.mkdir(parents=True, exist_ok=True)
+        return app_data_dir
+    return Path(__file__).resolve().parent
+
+def _get_bundle_dir() -> Path:
+    """Return PyInstaller's extraction dir when frozen; script dir otherwise."""
+    if getattr(sys, "frozen", False):
+        return Path(sys._MEIPASS)
+    return Path(__file__).resolve().parent
+
+BASE_DIR    = _get_app_dir()
+_BUNDLE_DIR = _get_bundle_dir()   # read-only bundled data (temp when frozen)
 ASSETS_DIR = BASE_DIR / "Assets"
 APP_ICON_PATH = ASSETS_DIR / "app_icon.ico"
 WINDOWS_DOWNLOADS_DIR = str(Path.home() / "Downloads")
@@ -79,6 +149,63 @@ YT_DLP_EXE = ASSETS_DIR / "yt-dlp.exe"
 FFMPEG_EXE = ASSETS_DIR / "ffmpeg.exe"
 FFPROBE_EXE = ASSETS_DIR / "ffprobe.exe"
 # ffplay removed — preview opens in browser instead
+
+
+def _bootstrap_assets():
+    """
+    First-run setup for frozen (PyInstaller) builds.
+
+    Copies every file from the bundled Assets folder (_MEIPASS/Assets)
+    to the persistent ASSETS_DIR next to the EXE — but only if the file
+    does not already exist there.  This preserves user-updated yt-dlp.exe
+    while still delivering the initial binaries on a fresh install.
+
+    Safe to call multiple times; no-op in dev mode or if files are present.
+    """
+    if not getattr(sys, "frozen", False):
+        return  # dev mode: assets are already on disk in the right place
+
+    bundle_assets = _BUNDLE_DIR / "Assets"
+    if not bundle_assets.exists():
+        return  # nothing to do
+
+    try:
+        ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return  # if we can't create the dir, give up silently
+
+    import shutil
+    for src in bundle_assets.iterdir():
+        try:
+            dst = ASSETS_DIR / src.name
+            if not dst.exists():
+                shutil.copy2(str(src), str(dst))
+        except Exception:
+            pass  # best-effort; log not available yet at this call site
+
+
+def _writable_assets_dir() -> Path:
+    """
+    Return a writable directory suitable for storing/updating yt-dlp.exe.
+
+    Tries ASSETS_DIR (next to the EXE) first.  If that is not writable
+    (e.g. the app was installed to C:\\Program Files), falls back to
+    %LOCALAPPDATA%\\Clipster\\Assets so updates never silently fail due to
+    permission errors.
+    """
+    # Quick write-ability probe
+    try:
+        ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+        probe = ASSETS_DIR / ".write_probe"
+        probe.touch()
+        probe.unlink()
+        return ASSETS_DIR
+    except (PermissionError, OSError):
+        pass
+
+    fallback = Path.home() / "AppData" / "Local" / "Clipster" / "Assets"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
 
 ALLOWED_FORMATS = ["mp4", "mkv", "webm", "m4a", "mp3"]
 
@@ -206,6 +333,8 @@ def _ytdlp_auto_update_background(ui_queue_ref):
     silently download and replace it. Posts a ui_queue event on completion.
     Only runs when _ytdlp_needs_update_check() returns True.
     """
+    global YT_DLP_EXE
+
     if not _ytdlp_needs_update_check():
         return
     _ytdlp_record_check()
@@ -230,16 +359,26 @@ def _ytdlp_auto_update_background(ui_queue_ref):
         )
         if not exe_url:
             return
-        log_message(f"yt-dlp auto-update: downloading {latest_tag}...")
-        tmp_path = ASSETS_DIR / "yt-dlp_updating.exe"
+
+        # Fix: verify we can actually write to ASSETS_DIR before downloading.
+        # If the app is installed in a protected folder (e.g. C:\Program Files),
+        # the update would silently fail.  Fall back to user-local AppData.
+        update_dir = _writable_assets_dir()
+
+        log_message(f"yt-dlp auto-update: downloading {latest_tag} to {update_dir}...")
+        tmp_path = update_dir / "yt-dlp_updating.exe"
+        target_path = update_dir / "yt-dlp.exe"
         with requests.get(exe_url, stream=True, timeout=90) as dl:
             dl.raise_for_status()
             with open(tmp_path, "wb") as f:
                 for chunk in dl.iter_content(chunk_size=65536):
                     if chunk:
                         f.write(chunk)
-        os.replace(str(tmp_path), str(YT_DLP_EXE))
-        log_message(f"yt-dlp auto-updated to {latest_tag}")
+        os.replace(str(tmp_path), str(target_path))
+        # If we updated to a different dir, point the global at the newer binary
+        
+        YT_DLP_EXE = target_path
+        log_message(f"yt-dlp auto-updated to {latest_tag} at {target_path}")
         if ui_queue_ref is not None:
             ui_queue_ref.put(("ytdlp_auto_updated", latest_tag))
     except Exception as e:
@@ -462,7 +601,7 @@ def check_executables():
 DEFAULT_SETTINGS = {
     "debug_mode": False,
     "default_format": "mp4",
-    "theme": "dark",
+    "theme": "system",
     "use_smart_naming": True,
 
     # default to user's Windows Downloads folder (cross-platform fallback)
@@ -565,66 +704,27 @@ def now_str():
     """Get current datetime as string."""
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-# ---------- Atomic JSON write/read with optional file lock ----------
-_FILE_LOCK_TIMEOUT = 5.0  # seconds for lock attempts
+# ---------- Atomic JSON write/read ----------
 
-def _acquire_file_lock(lock_path, timeout=_FILE_LOCK_TIMEOUT):
+def safe_write_json(path: Path, data):
     """
-    Best-effort cross-process lock:
-    Try to create a lock file atomically (O_CREAT|O_EXCL).
-    Return a file descriptor which should be closed/unlinked by caller.
-    If can't acquire within timeout, raise TimeoutError.
+    Write JSON atomically using tempfile + os.replace.
+
+    The .lock-file mechanism was removed in v1.3.4: os.replace() is
+    already atomic on Windows (NTFS) and the in-process _HISTORY_RW_LOCK
+    prevents concurrent writes within the same process.  The lock file was
+    causing spurious PermissionError when antivirus software scanned the
+    folder at the wrong moment.
     """
-
-    import errno
-
-    start = time.monotonic()
-    while True:
-        try:
-            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            # write pid for debugging
-            try:
-                os.write(fd, str(os.getpid()).encode("utf-8"))
-            except Exception:
-                pass
-            return fd
-        except OSError as e:
-            if e.errno != errno.EEXIST:
-                raise
-            if time.monotonic() - start > timeout:
-                raise TimeoutError(f"Could not acquire lock {lock_path}")
-            time.sleep(0.05)
-
-def _release_file_lock(fd, lock_path):
-    try:
-        os.close(fd)
-    except Exception:
-        pass
-    try:
-        os.unlink(lock_path)
-    except Exception:
-        pass
-
-
-
-
-def safe_write_json(path: Path, data, *, lock_suffix=".lock"):
-    """Write JSON atomically using tempfile + os.replace with optional lock."""
     path = Path(path)
-    lock_path = str(path) + lock_suffix
-    fd = None
+    tmpname = None
     try:
-        try:
-            fd = _acquire_file_lock(lock_path)
-        except TimeoutError:
-            # fallback to in-process lock only (best-effort)
-            log_message(f"safe_write_json: lock timeout for {path}, proceeding without lock")
-            fd = None
-
-        # write to temp file in same dir to ensure os.replace is atomic
         dirpath = path.parent
         dirpath.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=str(dirpath), delete=False) as tf:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=str(dirpath),
+            delete=False, suffix=".tmp"
+        ) as tf:
             json.dump(data, tf, indent=2, ensure_ascii=False)
             tf.flush()
             os.fsync(tf.fileno())
@@ -634,20 +734,14 @@ def safe_write_json(path: Path, data, *, lock_suffix=".lock"):
     except Exception as e:
         log_message(f"safe_write_json failed for {path}: {e}")
         try:
-            if 'tmpname' in locals() and os.path.exists(tmpname):
+            if tmpname and os.path.exists(tmpname):
                 os.unlink(tmpname)
         except Exception:
             pass
         return False
-    finally:
-        if fd:
-            try:
-                _release_file_lock(fd, lock_path)
-            except Exception:
-                pass
 
-def safe_read_json(path: Path, default=None, *, lock_suffix=".lock"):
-    """Read JSON file; if it fails return default. We don't lock on read to avoid contention."""
+def safe_read_json(path: Path, default=None):
+    """Read JSON file; if it fails return default."""
     try:
         if not Path(path).exists():
             return default
@@ -746,7 +840,7 @@ def windows_notify(title, message, open_path=None):
                 "title":    title,
                 "body":     message,
                 "duration": "short",
-                "app_id":   "Clipster.App.1.3.2",
+                "app_id":   "Clipster",
             }
 
             # App icon in the notification badge
@@ -847,6 +941,7 @@ def fetch_metadata_via_yt_dlp(url, timeout=METADATA_FETCH_TIMEOUT):
         "--no-playlist",
         "--dump-single-json",
         "--no-check-certificates",
+        "--ffmpeg-location", str(ASSETS_DIR),  # Fix: explicit ffmpeg path for frozen EXE
         url
     ]
     try:
@@ -920,7 +1015,8 @@ class DownloadProcess:
             return
         outtmpl = os.path.join(outdir, filename_template)
         cmd = [windows_quote(str(YT_DLP_EXE)), "--no-warnings", "--newline", "--continue",
-               "--windows-filenames"]  # auto-replace illegal filename chars
+               "--windows-filenames",   # auto-replace illegal filename chars
+               "--ffmpeg-location", str(ASSETS_DIR)]  # Fix: explicit ffmpeg path for frozen EXE
         if cookies_path:
             cmd += ["--cookies", windows_quote(cookies_path)]
         if format_selector == "__mp3__":
@@ -1240,6 +1336,8 @@ class ClipsterApp:
         self.root.after(50, self._build_ui)
         self.root.after(150, self._enable_mica_effect)
         self.root.after(100, self._process_ui_queue)
+        self.root.after(200, self._bind_shortcuts)
+        self.root.after(300, self._setup_tray)
 
         # Show window after setup to avoid flashing
         self.root.after(0, self._show_window_after_setup)
@@ -1252,71 +1350,153 @@ class ClipsterApp:
         ).start()
 
     def _build_skeleton_ui(self):
-        """Build minimal UI shell with custom animated tab system."""
+        """Build minimal UI shell with modern sidebar navigation."""
         self._create_titlebar()
         self._tab_names = ["Download", "History", "Settings", "Update"]
-        self._tab_icons = {"Download": "⏬", "History": "🕘", "Settings": "⚙️", "Update": "🔄"}
-        self._current_tab = None
+        self._tab_icons = {
+            "Download": "⬇",
+            "History":  "🕘",
+            "Settings": "⚙",
+            "Update":   "🔄",
+        }
+        self._tab_tooltips = {
+            "Download": "Download videos",
+            "History":  "View download history",
+            "Settings": "Configure Clipster",
+            "Update":   "Check for updates",
+        }
+        self._current_tab     = None
         self._tab_anim_running = False
-        self._tab_frames = {}          # name -> CTkFrame (content panel)
-        self._tab_built   = {}         # name -> bool
-        self._tab_btns    = {}         # name -> CTkButton
+        self._tab_frames      = {}   # name -> CTkFrame (content panel)
+        self._tab_built       = {}   # name -> bool
+        self._tab_btns        = {}   # name -> (wrap_frame, lbl, accent_bar)
         self._shimmer_running = False
 
-        # Outer wrapper
-        self._tab_outer = ctk.CTkFrame(self.root, corner_radius=0, fg_color="transparent")
-        self._tab_outer.pack(padx=12, pady=(4, 8), fill="both", expand=True)
+        is_dark = self.settings.get("theme", "dark") != "light"
 
-        # Custom tab bar — centered, underline-style tabs
-        self._tabbar = ctk.CTkFrame(self._tab_outer, height=52, corner_radius=0, fg_color="transparent")
-        self._tabbar.pack(fill="x", pady=(0, 0))
-        self._tabbar.pack_propagate(False)
+        # ── Root horizontal split: sidebar | content ─────────────────────────
+        self._root_split = ctk.CTkFrame(self.root, corner_radius=0, fg_color="transparent")
+        self._root_split.pack(fill="both", expand=True, padx=10, pady=(4, 10))
 
-        # Bottom border line for the whole tab bar
-        self._tabbar_border = ctk.CTkFrame(self._tab_outer, height=2, corner_radius=0, fg_color="#2A2A3A")
-        self._tabbar_border.pack(fill="x", pady=(0, 6))
+        # ─── Sidebar ─────────────────────────────────────────────────────────
+        sidebar_bg  = "#1C1C28" if is_dark else "#E8E8F2"
+        self._sidebar = ctk.CTkFrame(
+            self._root_split, width=190, corner_radius=14,
+            fg_color=sidebar_bg,
+        )
+        self._sidebar.pack(side="left", fill="y", padx=(0, 8))
+        self._sidebar.pack_propagate(False)
+        self._sidebar_bg    = sidebar_bg
+        self._sidebar_is_dark = is_dark
 
-        # Inner centering frame
-        self._tabbar_inner = ctk.CTkFrame(self._tabbar, fg_color="transparent")
-        self._tabbar_inner.place(relx=0.5, rely=0.5, anchor="center")
+        # Navigation label (no brand block — titlebar already shows name + version)
+        nav_label = ctk.CTkLabel(
+            self._sidebar, text="NAVIGATION",
+            font=ctk.CTkFont(size=9, weight="bold"),
+            text_color="#555566" if is_dark else "#9999AA",
+            anchor="w",
+        )
+        nav_label.pack(fill="x", padx=18, pady=(16, 4))
+
+        # Nav items
+        self._nav_frame = ctk.CTkFrame(self._sidebar, fg_color="transparent")
+        self._nav_frame.pack(fill="x", padx=8, pady=(0, 0))
+
+        hover_color  = "#2A2A3E" if is_dark else "#D8D8EC"
+        active_color = ACCENT_COLOR
 
         for name in self._tab_names:
-            icon = self._tab_icons.get(name, "")
-            # Each tab is a frame containing a label + animated underline bar
-            tab_wrap = ctk.CTkFrame(self._tabbar_inner, fg_color="transparent", cursor="hand2")
-            tab_wrap.pack(side="left", padx=4)
+            icon = self._tab_icons[name]
 
-            lbl = ctk.CTkLabel(
-                tab_wrap,
-                text=f"{icon}  {name}",
-                height=36,
-                font=ctk.CTkFont(size=13),
-                text_color="#777777",
-                padx=16,
+            # Pill wrapper
+            pill = ctk.CTkFrame(
+                self._nav_frame, corner_radius=10,
+                fg_color="transparent", cursor="hand2", height=44,
             )
-            lbl.pack(side="top")
+            pill.pack(fill="x", pady=2)
+            pill.pack_propagate(False)
 
-            # Underline indicator — hidden by default
-            indicator = ctk.CTkFrame(tab_wrap, height=3, corner_radius=2, fg_color=ACCENT_COLOR)
-            indicator.pack(fill="x", padx=8, pady=(0, 0))
-            indicator.pack_forget()   # hidden initially
+            # Left accent bar (3 px wide, hidden unless active)
+            accent_bar = ctk.CTkFrame(pill, width=3, corner_radius=2, fg_color=ACCENT_COLOR)
+            accent_bar.place(x=0, rely=0.15, relheight=0.70)
+            accent_bar.place_forget()
 
-            # Store refs
-            self._tab_btns[name] = (tab_wrap, lbl, indicator)
+            # Icon label
+            icon_lbl = ctk.CTkLabel(
+                pill, text=icon,
+                font=ctk.CTkFont(size=16), width=28,
+                text_color="#666677" if is_dark else "#888899",
+                anchor="center",
+            )
+            icon_lbl.place(x=14, rely=0.5, anchor="w")
 
-            # Bind clicks on both wrap and label
-            for widget in (tab_wrap, lbl):
-                widget.bind("<Button-1>", lambda e, n=name: self._switch_tab(n))
-                widget.bind("<Enter>", lambda e, l=lbl, n=name: self._on_tab_hover(l, n, True))
-                widget.bind("<Leave>", lambda e, l=lbl, n=name: self._on_tab_hover(l, n, False))
+            # Name label
+            lbl = ctk.CTkLabel(
+                pill, text=name,
+                font=ctk.CTkFont(size=13),
+                text_color="#666677" if is_dark else "#888899",
+                anchor="w",
+            )
+            lbl.place(x=48, rely=0.5, anchor="w")
 
-        # Content host
-        self._content_host = ctk.CTkFrame(self._tab_outer, corner_radius=12)
-        self._content_host.pack(fill="both", expand=True)
+            # Download badge — numeric pill shown only while items are downloading
+            if name == "Download":
+                self._dl_badge_lbl = ctk.CTkLabel(
+                    pill, text="0",
+                    font=ctk.CTkFont(size=9, weight="bold"),
+                    fg_color=DANGER_COLOR, corner_radius=8,
+                    width=18, height=18, text_color="white",
+                )
+                # hidden until there are active downloads
 
-        # Create all tab frames stacked in the same host (only one visible at a time)
+            self._tab_btns[name] = (pill, lbl, accent_bar, icon_lbl)
+
+            def _click(e, n=name):
+                self._switch_tab(n)
+
+            def _enter(e, p=pill, l=lbl, il=icon_lbl, n=name, hc=hover_color):
+                if n != self._current_tab:
+                    p.configure(fg_color=hc)
+                    l.configure(text_color="#DDDDEE" if self._sidebar_is_dark else "#333344")
+                    il.configure(text_color="#DDDDEE" if self._sidebar_is_dark else "#333344")
+
+            def _leave(e, p=pill, l=lbl, il=icon_lbl, n=name):
+                if n != self._current_tab:
+                    p.configure(fg_color="transparent")
+                    l.configure(text_color="#666677" if self._sidebar_is_dark else "#888899")
+                    il.configure(text_color="#666677" if self._sidebar_is_dark else "#888899")
+
+            for widget in (pill, lbl, icon_lbl):
+                widget.bind("<Button-1>", _click)
+                widget.bind("<Enter>",    _enter)
+                widget.bind("<Leave>",    _leave)
+
+        # ── Sidebar footer: theme toggle hint ─────────────────────────────────
+        footer = ctk.CTkFrame(self._sidebar, fg_color="transparent")
+        footer.pack(side="bottom", fill="x", padx=12, pady=(0, 14))
+
+        sep2 = ctk.CTkFrame(footer, height=1, corner_radius=0,
+                            fg_color="#2E2E42" if is_dark else "#D0D0DC")
+        sep2.pack(fill="x", pady=(0, 10))
+
+        self._sb_tagline = ctk.CTkLabel(
+            footer, text=SPLASH_TEXT,
+            font=ctk.CTkFont(size=9),
+            text_color="#444455" if is_dark else "#AAAABC",
+            anchor="w",
+        )
+        self._sb_tagline.pack(fill="x", padx=4)
+
+        # ── Content area ──────────────────────────────────────────────────────
+        self._content_host = ctk.CTkFrame(self._root_split, corner_radius=14)
+        self._content_host.pack(side="left", fill="both", expand=True)
+
+        # Backward compat — old code uses self._tab_outer
+        self._tab_outer = self._content_host
+
+        # Create all tab frames stacked inside content host
         for name in self._tab_names:
-            f = ctk.CTkFrame(self._content_host, corner_radius=12, fg_color="transparent")
+            f = ctk.CTkFrame(self._content_host, corner_radius=14, fg_color="transparent")
             f.place(relx=0, rely=0, relwidth=1, relheight=1)
             f.lower()
             self._tab_frames[name] = f
@@ -1329,10 +1509,172 @@ class ClipsterApp:
         self.root.after(60, lambda: self._switch_tab("Download", animated=False))
 
     def _on_tab_hover(self, lbl, name, entering):
-        """Lighten label on hover if not the active tab."""
-        if name == self._current_tab:
-            return
-        lbl.configure(text_color="#CCCCCC" if entering else "#777777")
+        """(legacy shim — hover is now handled inline per sidebar pill)."""
+        pass
+
+    # ── Keyboard shortcuts ─────────────────────────────────────────────────
+    def _bind_shortcuts(self):
+        """Bind global keyboard shortcuts to the root window."""
+        try:
+            # Ctrl+V  → Paste & Add (only when URL entry doesn't have focus)
+            def _ctrl_v(e):
+                focused = self.root.focus_get()
+                if focused and hasattr(focused, "insert"):
+                    return   # let the widget handle its own paste
+                try:
+                    self._dl_paste_and_add()
+                except Exception:
+                    pass
+
+            self.root.bind("<Control-v>", _ctrl_v)
+            self.root.bind("<Control-V>", _ctrl_v)
+
+            # Ctrl+H  → jump to History
+            self.root.bind("<Control-h>", lambda e: self._switch_tab("History"))
+            self.root.bind("<Control-H>", lambda e: self._switch_tab("History"))
+
+            # Ctrl+D  → jump to Download
+            self.root.bind("<Control-d>", lambda e: self._switch_tab("Download"))
+            self.root.bind("<Control-D>", lambda e: self._switch_tab("Download"))
+
+            # Escape  → cancel active fetch / close any overlay
+            self.root.bind("<Escape>", lambda e: self._kb_escape())
+        except Exception as ex:
+            log_message(f"_bind_shortcuts error: {ex}")
+
+    def _kb_escape(self):
+        cancelled = False
+        try:
+            if hasattr(self, "_dl_queue") and hasattr(self, "_dl_queue_lock"):
+                with self._dl_queue_lock:
+                    for entry in self._dl_queue:
+                        if entry.get("status") == "fetching":
+                            cf = entry.get("_cancel_flag")
+                            if cf:
+                                cf.set()
+                                cancelled = True
+        except Exception:
+            pass
+        if cancelled:
+            _toast(self, "Fetch cancelled.", level="error")
+
+    # ── System Tray ────────────────────────────────────────────────────────
+    def _setup_tray(self):
+        """Set up a pystray system-tray icon (Windows). Falls back silently if unavailable."""
+        try:
+            import pystray
+            from PIL import Image as _PILImg
+            ico_path = ASSETS_DIR / "clipster.ico"
+            png_path = ASSETS_DIR / "clipster.png"
+            img_path = png_path if png_path.exists() else (ico_path if ico_path.exists() else None)
+            if img_path is None:
+                return
+            img = _PILImg.open(str(img_path)).convert("RGBA").resize((64, 64))
+
+            def _show(icon=None, item=None):
+                self.root.after(0, self._show_from_tray)
+
+            def _dl_all(icon=None, item=None):
+                self.root.after(0, self._show_from_tray)
+                self.root.after(100, self._dl_start_all)
+
+            def _quit(icon=None, item=None):
+                try:
+                    self._tray_icon.stop()
+                except Exception:
+                    pass
+                self.root.after(0, self._force_quit)
+
+            menu = pystray.Menu(
+                pystray.MenuItem("Show Clipster", _show, default=True),
+                pystray.MenuItem("Download All",  _dl_all),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Quit",          _quit),
+            )
+            self._tray_icon = pystray.Icon("Clipster", img, "Clipster", menu)
+            threading.Thread(target=self._tray_icon.run, daemon=True).start()
+            log_message("System tray icon started.")
+        except ImportError:
+            self._tray_icon = None
+            log_message("pystray not installed — tray icon disabled.")
+        except Exception as ex:
+            self._tray_icon = None
+            log_message(f"_setup_tray error: {ex}")
+
+    def _hide_to_tray(self):
+        """Minimize the window to the system tray."""
+        self.root.withdraw()
+
+    def _show_from_tray(self):
+        """Restore the window from the system tray."""
+        try:
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+        except Exception:
+            pass
+
+    def _force_quit(self):
+        """Hard quit — called from tray Quit action."""
+        try:
+            self.graceful_shutdown()
+        except Exception:
+            pass
+        try:
+            self.root.quit()
+            self.root.destroy()
+        except Exception:
+            pass
+
+    # ── Speed Sparkline ────────────────────────────────────────────────────
+    def _draw_sparkline(self, canvas, samples):
+        """Draw a mini area-chart of download speed samples onto a tkinter Canvas."""
+        try:
+            canvas.delete("all")
+            w = int(canvas.winfo_width())  or 72
+            h = int(canvas.winfo_height()) or 28
+            if not samples:
+                return
+            max_v = max(samples) or 1.0
+            n     = len(samples)
+            pad_x = 2
+            pad_y = 3
+            step  = (w - pad_x * 2) / max(n - 1, 1)
+            pts   = []
+            for i, v in enumerate(samples):
+                x = pad_x + i * step
+                y = h - pad_y - (v / max_v) * (h - pad_y * 2)
+                pts.append((x, y))
+            # Filled polygon (area under curve)
+            poly = list(pts)
+            poly.append((pts[-1][0], h - pad_y))
+            poly.append((pts[0][0],  h - pad_y))
+            flat = [c for xy in poly for c in xy]
+            canvas.create_polygon(flat, fill="#1D4ED8", outline="", smooth=True)
+            # Line on top
+            if len(pts) >= 2:
+                line_flat = [c for xy in pts for c in xy]
+                canvas.create_line(line_flat, fill=ACCENT_COLOR, width=1.5, smooth=True)
+        except Exception:
+            pass
+
+    # ── Download badge ─────────────────────────────────────────────────────
+    def _update_download_badge(self):
+        """Show/hide the numeric active-download badge on the sidebar Download pill."""
+        try:
+            with self._dl_queue_lock:
+                active = sum(1 for e in self._dl_queue
+                             if e.get("status") == "downloading")
+            badge = getattr(self, "_dl_badge_lbl", None)
+            if badge is None:
+                return
+            if active > 0:
+                badge.configure(text=str(active))
+                badge.place(relx=1.0, rely=0.0, anchor="ne", x=-4, y=4)
+            else:
+                badge.place_forget()
+        except Exception:
+            pass
 
     # Tab switching with animation
     def _switch_tab(self, name, animated=True):
@@ -1345,17 +1687,28 @@ class ClipsterApp:
         prev = self._current_tab
         self._current_tab = name
 
-        # Update tab label + indicator styles
-        for n, (wrap, lbl, indicator) in self._tab_btns.items():
+        # ── Update sidebar pill / button states ───────────────────────────────
+        is_dark = getattr(self, "_sidebar_is_dark", True)
+        for n, btn_data in self._tab_btns.items():
+            pill, lbl, accent_bar, icon_lbl = btn_data
             if n == name:
-                lbl.configure(text_color="white",
-                              font=ctk.CTkFont(size=13, weight="bold"))
-                indicator.pack(fill="x", padx=8, pady=(0, 0))
-                self._animate_indicator(indicator, 0, 1)
+                # Active state — accent fill
+                pill.configure(fg_color=ACCENT_COLOR)
+                lbl.configure(
+                    text_color="white",
+                    font=ctk.CTkFont(size=13, weight="bold"),
+                )
+                icon_lbl.configure(text_color="white")
+                accent_bar.place_forget()          # bar hidden (pill is filled)
             else:
-                lbl.configure(text_color="#777777",
-                              font=ctk.CTkFont(size=13))
-                indicator.pack_forget()
+                # Idle state
+                pill.configure(fg_color="transparent")
+                lbl.configure(
+                    text_color="#666677" if is_dark else "#888899",
+                    font=ctk.CTkFont(size=13),
+                )
+                icon_lbl.configure(text_color="#666677" if is_dark else "#888899")
+                accent_bar.place_forget()
 
         new_frame  = self._tab_frames[name]
         prev_frame = self._tab_frames.get(prev) if prev else None
@@ -1372,20 +1725,8 @@ class ClipsterApp:
         self._animate_tab_in(new_frame, prev_frame, animated)
 
     def _animate_indicator(self, indicator, step=0, total=8):
-        """Animate the underline indicator width growing in from left."""
-        try:
-            if not indicator.winfo_exists():
-                return
-            if step >= total:
-                return
-            # We use padx to simulate a growing width: start with big padx, shrink to 8
-            progress = step / total
-            ease = 1 - (1 - progress) ** 2
-            pad = int(8 + (40 * (1 - ease)))
-            indicator.pack_configure(padx=pad)
-            indicator.after(14, lambda: self._animate_indicator(indicator, step + 1, total))
-        except Exception:
-            pass
+        """(No-op — underline indicators replaced by sidebar pill highlights.)"""
+        pass
 
     def _lazy_build_tab(self, name, frame, animated):
         """Build the real tab content, then animate it in."""
@@ -1660,7 +2001,7 @@ class ClipsterApp:
         # Re-affirm AppUserModelID now that we have an HWND, ensuring the
         # taskbar groups this window under Clipster (not python.exe)
         try:
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Clipster.App.1.3.2")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Clipster")
         except Exception:
             pass
 
@@ -1760,6 +2101,14 @@ class ClipsterApp:
     def _enable_mica_effect(self):
         """Enable Mica effect on Windows 11."""
         import ctypes
+        # Fix: root.update() ensures the window is mapped (has a real HWND) before
+        # we call DwmSetWindowAttribute.  Without this, DWM may silently fail on
+        # the very first call if the window hasn't been presented yet.
+        try:
+            self.root.update()
+        except Exception:
+            pass
+
         hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
 
         DWMWA_SYSTEMBACKDROP_TYPE = 38
@@ -1852,20 +2201,23 @@ class ClipsterApp:
         self._animate_window("show")
 
     def _minimize_window(self):
-        """Minimize the window with animation."""
-        self._animate_window("hide")
-        self.root.iconify()
+        """Minimize: hide to tray if tray is available, otherwise iconify."""
+        tray = getattr(self, "_tray_icon", None)
+        if tray is not None:
+            self._hide_to_tray()
+        else:
+            self._animate_window("hide")
+            self.root.iconify()
 
     def _close_window(self):
-        try:
-            self.graceful_shutdown()
-        except Exception:
-            pass
-        try:
-            self.root.quit()
-            self.root.destroy()
-        except Exception:
-            pass
+        from win11toast import toast
+        """X button: hide to tray if available, otherwise quit fully."""
+        tray = getattr(self, "_tray_icon", None)
+        if tray is not None:
+            self._hide_to_tray()
+            _toast(self, "Clipster is running in the system tray.", level="info")
+        else:
+            self._force_quit()
 
     def graceful_shutdown(self):
         """Safely shut down downloads, background workers, and temp files."""
@@ -1941,8 +2293,35 @@ class ClipsterApp:
         else:
             self.root.after(300, self.load_and_render_history)
         self._update_titlebar_theme()
+        self._update_sidebar_theme()
         self._enable_mica_effect()
         self.root.update_idletasks()
+
+    def _update_sidebar_theme(self):
+        """Re-colour sidebar when theme changes."""
+        try:
+            is_dark = self.settings.get("theme", "dark") != "light"
+            self._sidebar_is_dark = is_dark
+            sidebar_bg = "#1C1C28" if is_dark else "#E8E8F2"
+            idle_text  = "#666677" if is_dark else "#888899"
+            self._sidebar_bg = sidebar_bg
+            try:
+                self._sidebar.configure(fg_color=sidebar_bg)
+            except Exception:
+                pass
+            # Re-apply active/idle colours for nav pills
+            for n, btn_data in self._tab_btns.items():
+                pill, lbl, accent_bar, icon_lbl = btn_data
+                if n == self._current_tab:
+                    pill.configure(fg_color=ACCENT_COLOR)
+                    lbl.configure(text_color="white")
+                    icon_lbl.configure(text_color="white")
+                else:
+                    pill.configure(fg_color="transparent")
+                    lbl.configure(text_color=idle_text)
+                    icon_lbl.configure(text_color=idle_text)
+        except Exception:
+            pass
 
     def _on_theme_combo_changed(self, choice):
         """Called when the user picks a new theme from the combo box — preview only, not saved."""
@@ -2366,8 +2745,11 @@ class ClipsterApp:
             "_status_lbl":   None,
             "_progress_bar": None,
             "_speed_lbl":    None,
+            "_sparkline_canvas": None,
             "_size_lbl":     None,
             "_cancel_flag":  threading.Event(),
+            "_speed_samples":    [],
+            "_sparkline_canvas": None,
         }
 
         with self._dl_queue_lock:
@@ -2616,6 +2998,8 @@ class ClipsterApp:
                 "_progress_pct": 0.0,
                 "_speed_text":   "",
                 "_cancel_flag":  threading.Event(),
+                "_speed_samples":    [],
+                "_sparkline_canvas": None,
             }
             with self._dl_queue_lock:
                 idx = len(self._dl_queue)
@@ -2913,7 +3297,7 @@ class ClipsterApp:
             size_lbl.pack(side="left")
             entry["_size_lbl"] = size_lbl
 
-        # ── Line 4: per-item progress bar + speed/ETA + cancel (only while downloading) ──
+        # ── Line 4: per-item progress bar + sparkline + speed/ETA + cancel (only while downloading) ──
         if is_downloading:
             prog_frame = ctk.CTkFrame(row, fg_color="transparent")
             prog_frame.grid(row=3, column=0, columnspan=4, sticky="ew",
@@ -2927,9 +3311,19 @@ class ClipsterApp:
             pbar.pack(side="left", fill="x", expand=True, padx=(0, 8))
             entry["_progress_bar"] = pbar
 
+            # Speed sparkline — mini area chart of last 30 samples
+            import tkinter as tk
+            is_dark_row = self.settings.get("theme", "dark") != "light"
+            spark_bg  = "#12121C" if is_dark_row else "#E8E8F4"
+            spark_cv  = tk.Canvas(prog_frame, height=28, width=72,
+                                  bg=spark_bg, highlightthickness=0, bd=0)
+            spark_cv.pack(side="left", padx=(0, 6))
+            entry["_sparkline_canvas"] = spark_cv
+            self._draw_sparkline(spark_cv, entry.get("_speed_samples", []))
+
             speed_lbl = ctk.CTkLabel(
                 prog_frame, text=entry.get("_speed_text", ""),
-                font=ctk.CTkFont(size=10), text_color="#aaaaaa", width=100, anchor="e"
+                font=ctk.CTkFont(size=10), text_color="#aaaaaa", width=90, anchor="e"
             )
             speed_lbl.pack(side="left", expand=False)
             entry["_speed_lbl"] = speed_lbl
@@ -3590,9 +3984,15 @@ class ClipsterApp:
 
                 _set_status(f"Downloading yt-dlp {latest_tag}...")
 
-                # Download to a staging file in the SAME directory as yt-dlp.exe
-                # so os.replace() is guaranteed atomic (same volume, no cross-drive copy).
-                tmp_path = ASSETS_DIR / "yt-dlp_updating.exe"
+                # Fix: probe ASSETS_DIR for write permission before downloading.
+                # Users who installed to C:\Program Files won't have write access
+                # there; _writable_assets_dir() falls back to %LOCALAPPDATA%\Clipster.
+                update_dir = _writable_assets_dir()
+
+                # Staging file sits in the same directory as the final target so
+                # os.replace() is guaranteed atomic (same volume, no cross-drive copy).
+                tmp_path    = update_dir / "yt-dlp_updating.exe"
+                target_path = update_dir / "yt-dlp.exe"
                 with requests.get(exe_url, stream=True, timeout=60) as dl:
                     dl.raise_for_status()
                     total = int(dl.headers.get("Content-Length", 0))
@@ -3608,10 +4008,14 @@ class ClipsterApp:
                                 self.root.after(0, lambda p=pct: progress_bar.set(p) if progress_bar else None)
 
                 # Atomic replace — os.replace works even when dest already exists on Windows
-                os.replace(str(tmp_path), str(YT_DLP_EXE))
+                os.replace(str(tmp_path), str(target_path))
+
+                # Update the module-level global so the new binary is used immediately
+                global YT_DLP_EXE
+                YT_DLP_EXE = target_path
 
                 _set_status(f"✅ yt-dlp updated to {latest_tag}!", SUCCESS_COLOR)
-                log_message(f"yt-dlp updated to {latest_tag}")
+                log_message(f"yt-dlp updated to {latest_tag} at {target_path}")
 
                 # Hide progress bar, re-enable button
                 def _done():
@@ -4209,6 +4613,7 @@ class ClipsterApp:
                 with self._dl_queue_lock:
                     entry = self._dl_queue[queue_idx] if 0 <= queue_idx < len(self._dl_queue) else None
                 if entry:
+                    # ── Progress bar ──────────────────────────────────────
                     pbar = entry.get("_progress_bar")
                     if pbar:
                         try:
@@ -4216,6 +4621,7 @@ class ClipsterApp:
                                 pbar.set(pval)
                         except Exception:
                             pass
+                    # ── Speed label ───────────────────────────────────────
                     slbl = entry.get("_speed_lbl")
                     if slbl:
                         try:
@@ -4223,9 +4629,33 @@ class ClipsterApp:
                                 slbl.configure(text=speed_text)
                         except Exception:
                             pass
+                    # ── Sparkline ─────────────────────────────────────────
+                    # Parse MB/s or KB/s out of speed_text and push to sample ring
+                    try:
+                        import re as _re
+                        m = _re.search(r"([\d.]+)\s*(MiB|KiB|MB|KB)/s", speed_text)
+                        if m:
+                            val = float(m.group(1))
+                            unit = m.group(2)
+                            if unit in ("KiB", "KB"):
+                                val /= 1024.0
+                            samples = entry.setdefault("_speed_samples", [])
+                            samples.append(val)
+                            if len(samples) > 30:
+                                samples.pop(0)
+                            cv = entry.get("_sparkline_canvas")
+                            if cv:
+                                try:
+                                    if cv.winfo_exists():
+                                        self._draw_sparkline(cv, samples)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
             except Exception:
                 pass
             self._dl_update_summary()
+            self._update_download_badge()
             return
 
         if ev == "dl_overall_progress":
@@ -4258,6 +4688,7 @@ class ClipsterApp:
             # Full rebuild needed: row layout changes (progress bar appears/disappears)
             self._dl_render_queue()
             self._dl_update_summary()
+            self._update_download_badge()
             return
 
         if ev == "dl_meta_ready":
@@ -4470,11 +4901,35 @@ class ClipsterApp:
             except Exception:
                 pass
             os.startfile(new_exe_path)
-            self._close_window()
+            self._force_quit()
             return
 
 if __name__ == "__main__":
+    # --- SINGLE INSTANCE CHECK START ---
+    if sys.platform == "win32":
+        import ctypes
+        mutex_name = "ClipsterApp_SingleInstance_Mutex_Lock"
+        mutex = ctypes.windll.kernel32.CreateMutexW(None, False, mutex_name)
+        
+        # Error 183 means ERROR_ALREADY_EXISTS
+        if ctypes.windll.kernel32.GetLastError() == 183:
+            # 1. Find the running window by its exact title
+            # Note: Ensure APP_NAME matches exactly what is in your self.root.title()
+            hwnd = ctypes.windll.user32.FindWindowW(None, APP_NAME)
+            
+            if hwnd:
+                # 2. SW_RESTORE = 9 (Restores the window if it is minimized or hidden)
+                ctypes.windll.user32.ShowWindow(hwnd, 9)
+                # 3. Bring the window to the foreground
+                ctypes.windll.user32.SetForegroundWindow(hwnd)
+            
+            # 4. Exit this duplicate instance quietly
+            sys.exit(0)
+    # --- SINGLE INSTANCE CHECK END ---
+
     try:
+        # Fix 1: On first run of a frozen EXE...
+        _bootstrap_assets()
         ensure_directories()    
         root = ctk.CTk()
         
@@ -4482,6 +4937,7 @@ if __name__ == "__main__":
         app = ClipsterApp(root)
         _app = app
 
+        root.update() # Ensure window is mapped
         root.mainloop()
 
     except Exception as e:
@@ -4489,9 +4945,7 @@ if __name__ == "__main__":
         tb = traceback.format_exc()
         log_message(f"Unhandled exception in main: {e}\n{tb}")
         try:
+            from tkinter import messagebox
             messagebox.showerror(APP_NAME, f"Fatal error during startup:\n{e}\n\nSee clipster.log for details.")
-        except Exception:
+        except:
             pass
-        print("Fatal error during startup — see clipster.log for details.")
-        print(tb)
-        sys.exit(1)
