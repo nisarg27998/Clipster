@@ -35,7 +35,7 @@
 
 1. Visit the Releases page:
    👉 https://github.com/nisarg27998/Clipster/releases
-2. Download **Clipster v1.3.1 (.exe)**
+2. Download **Clipster v1.3.3 (.exe)**
 3. Run directly — no installation required.
 
 ---
@@ -61,7 +61,7 @@ Clipster ships fully portable with:
 - 📊 Per-item and overall progress tracking
 - 💾 Persistent download history
 - ⚙️ Configurable format, theme & download path
-- 🔔 Windows 11 native notifications
+- 🔔 Windows 11 native notif3ications
 - 🎨 Custom Windows 11 titlebar + Mica
 - 🌙 Light / Dark theme support
 - 🔄 Built-in update checker
